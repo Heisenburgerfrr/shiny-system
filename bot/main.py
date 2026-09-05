@@ -9,17 +9,20 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from telegram.ext import ApplicationBuilder, CommandHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
 # 1. Initialize logging
 from bot.logger import setup_logging
 # 2. Load and validate configuration
 from bot.config import config
-# 3. Import command handlers and error handler
+# 3. Database job store
+from bot.db import job_store
+# 4. Import command handlers, message handlers, and error handler
 from bot.handlers import (
     global_error_handler,
     start_command,
     status_command,
+    youtube_url_handler,
 )
 
 
@@ -29,6 +32,15 @@ def main() -> None:
     logger = setup_logging(config.log_level)
     logger.info("Initializing bot with %d authorized user ID(s)...", len(config.allowed_telegram_user_ids))
 
+    # Recover any jobs interrupted during a previous run / unexpected termination
+    recovered = job_store.recover_interrupted_jobs()
+    if recovered:
+        logger.warning(
+            "Recovered and cleaned up %d interrupted job(s) from previous session: %s",
+            len(recovered),
+            recovered,
+        )
+
     # Build python-telegram-bot Application
     application = (
         ApplicationBuilder()
@@ -36,9 +48,14 @@ def main() -> None:
         .build()
     )
 
-    # Register handlers
+    # Register command handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("status", status_command))
+
+    # Register YouTube URL text message handler (filters out commands)
+    application.add_handler(
+        MessageHandler(filters.TEXT & (~filters.COMMAND), youtube_url_handler)
+    )
 
     # Register global error handler
     application.add_error_handler(global_error_handler)

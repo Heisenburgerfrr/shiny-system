@@ -1,18 +1,29 @@
-"""Telegram command handlers, access control, and diagnostic checks."""
+"""Telegram command handlers, access control, diagnostic checks, and video download handlers."""
 
 import asyncio
 import functools
 import logging
-from typing import Callable, Tuple
+import re
+import time
+import uuid
+from typing import Callable, Optional, Tuple
 
 import httpx
 from azure.storage.blob import BlobServiceClient
-from telegram import Update
+from telegram import Message, Update
 from telegram.ext import ContextTypes
 
 from bot.config import config
+from bot.db import job_store
+from bot.downloader import DownloadResult, _format_bytes, _format_seconds, downloader
 
 logger = logging.getLogger("bot.handlers")
+
+# Regex to detect YouTube URLs (videos, shorts, youtu.be, live streams)
+YOUTUBE_URL_REGEX = re.compile(
+    r"(https?://(?:www\.)?(?:youtube\.com/(?:watch\?[^\s]*v=|shorts/|live/|embed/)|youtu\.be/)[a-zA-Z0-9_\-]+[^\s]*)",
+    re.IGNORECASE,
+)
 
 
 def restricted(func: Callable) -> Callable:
@@ -107,7 +118,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     welcome_message = (
         "🤖 **Bot is online and operational.**\n\n"
         "Welcome! You are authorized to use this bot.\n\n"
-        "Available commands:\n"
+        "Available commands & features:\n"
+        "• Send any **YouTube link** to download the video\n"
         "• `/status` - Verify external connections (Instagram, Azure, Telegram)"
     )
     if update.effective_message:
@@ -155,6 +167,128 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.effective_message.reply_text(report, parse_mode="Markdown")
 
 
+# =====================================================================
+# Stage 2: YouTube URL Detection & Download Pipeline
+# =====================================================================
+
+async def _update_progress_message(
+    status_msg: Message,
+    text: str,
+) -> None:
+    """Safely edits the status message without crashing on Telegram API errors."""
+    try:
+        await status_msg.edit_text(text, parse_mode="Markdown")
+    except Exception as exc:
+        # Ignore Telegram 'Message is not modified' or minor rate-limit blips
+        logger.debug("Minor exception editing progress message: %s", exc)
+
+
+async def _run_download_background(
+    job_id: str,
+    url: str,
+    status_msg: Message,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """
+    Runs the download in background, manages rate-limited Telegram edits,
+    and updates SQLite job state upon completion or failure.
+    """
+    logger.info("[%s] Starting background download task for url: %s", job_id, url)
+    last_edit_time = 0.0
+    MIN_EDIT_INTERVAL = 1.8  # Seconds between Telegram edits to avoid 429 errors
+
+    def progress_callback(percent: float, speed_str: str, eta_str: str) -> None:
+        nonlocal last_edit_time
+        now = time.time()
+        if now - last_edit_time >= MIN_EDIT_INTERVAL:
+            last_edit_time = now
+            msg_text = (
+                f"📥 **Downloading YouTube Video**\n\n"
+                f"• **Job ID**: `{job_id[:8]}...`\n"
+                f"• **Progress**: `{percent:.1f}%`\n"
+                f"• **Speed**: `{speed_str}`\n"
+                f"• **ETA**: `{eta_str}`"
+            )
+            # Schedule message update on the main event loop thread-safely
+            asyncio.run_coroutine_threadsafe(
+                _update_progress_message(status_msg, msg_text),
+                loop,
+            )
+
+    try:
+        result = await downloader.download(
+            job_id=job_id,
+            url=url,
+            progress_callback=progress_callback,
+        )
+
+        # Success message
+        duration_str = _format_seconds(result.duration)
+        size_str = _format_bytes(result.file_size)
+        completion_msg = (
+            f"✅ **Download Complete**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Title**: {result.title}\n"
+            f"• **Duration**: `{duration_str}`\n"
+            f"• **File Size**: `{size_str}`\n"
+            f"• **Status**: Ready for processing (Stage 3)"
+        )
+        await _update_progress_message(status_msg, completion_msg)
+        logger.info("[%s] Download pipeline succeeded for title: '%s'", job_id, result.title)
+
+    except Exception as exc:
+        err_msg = str(exc)
+        clean_err = re.sub(r"^\[[A-Z_]+\]\s*", "", err_msg)
+        logger.error("[%s] Background download failed: %s", job_id, err_msg)
+
+        failure_msg = (
+            f"❌ **Download Failed**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Reason**: {clean_err}\n\n"
+            f"Please check the URL or try again."
+        )
+        await _update_progress_message(status_msg, failure_msg)
+
+
+@restricted
+async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Detects YouTube URLs in text messages from authorized users, registers
+    a job in SQLite, acknowledges immediately, and begins background download.
+    """
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    match = YOUTUBE_URL_REGEX.search(message.text)
+    if not match:
+        # Message is not a YouTube URL; ignore or let other handlers process
+        return
+
+    url = match.group(1).strip()
+    user = update.effective_user
+    user_id = user.id if user else 0
+
+    # 1. Generate unique Job ID (UUID4)
+    job_id = str(uuid.uuid4())
+    logger.info("New download job registered: job_id=%s, user_id=%s, url=%s", job_id, user_id, url)
+
+    # 2. Persist in SQLite Job Store
+    job_store.create_job(job_id=job_id, user_id=user_id, source_url=url)
+
+    # 3. Send immediate acknowledgment message
+    ack_text = (
+        f"📥 **Download Request Received**\n\n"
+        f"• **Job ID**: `{job_id}`\n"
+        f"• **Status**: Connecting to YouTube..."
+    )
+    status_msg = await message.reply_text(ack_text, parse_mode="Markdown")
+
+    # 4. Start background download task without blocking the polling event loop
+    loop = asyncio.get_running_loop()
+    asyncio.create_task(_run_download_background(job_id, url, status_msg, loop))
+
+
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Global error handler for unhandled exceptions in any handler.
@@ -171,15 +305,16 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 # Stubs for Subsequent Stages
 # =====================================================================
 
-async def download_youtube_video(url: str) -> str:
+async def download_youtube_video(url: str, job_id: Optional[str] = None) -> DownloadResult:
     """
-    Placeholder for downloading YouTube videos.
-    # TODO: Stage 2 - Implement yt-dlp download pipeline
+    Public entry point for downloading YouTube videos.
+    Uses YouTubeDownloader implemented in Stage 2.
     """
-    raise NotImplementedError("Stage 2 not implemented yet.")
+    jid = job_id or str(uuid.uuid4())
+    return await downloader.download(job_id=jid, url=url)
 
 
-async def process_video(input_path: str) -> str:
+async def process_video(input_path: str, job_id: str) -> str:
     """
     Placeholder for video processing and aspect ratio conversion.
     # TODO: Stage 3 - Implement ffmpeg video processing pipeline
@@ -187,7 +322,7 @@ async def process_video(input_path: str) -> str:
     raise NotImplementedError("Stage 3 not implemented yet.")
 
 
-async def publish_to_instagram(video_url: str, caption: str) -> str:
+async def publish_to_instagram(video_url: str, caption: str, job_id: str) -> str:
     """
     Placeholder for uploading to Azure Blob and publishing to Instagram.
     # TODO: Stage 4 - Implement Azure Blob upload and Instagram Graph API publishing

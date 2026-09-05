@@ -3,7 +3,7 @@
 import os
 import sys
 from dataclasses import dataclass
-from typing import Set
+from typing import List, Optional, Set
 from dotenv import load_dotenv
 
 # Load variables from .env file if present
@@ -19,6 +19,9 @@ class Settings:
     instagram_business_account_id: str
     azure_storage_connection_string: str
     log_level: str
+    ytdlp_cookies_path: Optional[str]
+    ytdlp_proxy_url: Optional[str]
+    ytdlp_player_clients: List[str]
 
 
 def _load_and_validate_settings() -> Settings:
@@ -82,6 +85,18 @@ def _load_and_validate_settings() -> Settings:
             f"Invalid LOG_LEVEL '{log_level}'. Must be one of: {', '.join(sorted(valid_log_levels))}"
         )
 
+    # 7. YTDLP_COOKIES_PATH (optional)
+    ytdlp_cookies_path = os.getenv("YTDLP_COOKIES_PATH", "").strip() or None
+
+    # 8. YTDLP_PROXY_URL (optional)
+    ytdlp_proxy_url = os.getenv("YTDLP_PROXY_URL", "").strip() or None
+
+    # 9. YTDLP_PLAYER_CLIENTS (optional, default: android,ios,web)
+    raw_clients = os.getenv("YTDLP_PLAYER_CLIENTS", "android,ios,web").strip()
+    ytdlp_player_clients = [c.strip() for c in raw_clients.split(",") if c.strip()]
+    if not ytdlp_player_clients:
+        ytdlp_player_clients = ["android", "ios", "web"]
+
     if errors:
         error_msg = "\n".join(f"  - {err}" for err in errors)
         raise RuntimeError(
@@ -97,6 +112,9 @@ def _load_and_validate_settings() -> Settings:
         instagram_business_account_id=instagram_business_account_id,
         azure_storage_connection_string=azure_storage_connection_string,
         log_level=log_level,
+        ytdlp_cookies_path=ytdlp_cookies_path,
+        ytdlp_proxy_url=ytdlp_proxy_url,
+        ytdlp_player_clients=ytdlp_player_clients,
     )
 
 
@@ -110,3 +128,6 @@ INSTAGRAM_ACCESS_TOKEN = config.instagram_access_token
 INSTAGRAM_BUSINESS_ACCOUNT_ID = config.instagram_business_account_id
 AZURE_STORAGE_CONNECTION_STRING = config.azure_storage_connection_string
 LOG_LEVEL = config.log_level
+YTDLP_COOKIES_PATH = config.ytdlp_cookies_path
+YTDLP_PROXY_URL = config.ytdlp_proxy_url
+YTDLP_PLAYER_CLIENTS = config.ytdlp_player_clients
