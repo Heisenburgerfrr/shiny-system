@@ -71,6 +71,14 @@ class JobStore:
                 conn.execute("ALTER TABLE jobs ADD COLUMN video_sas_url TEXT")
             if "video_sas_expires_at" not in columns:
                 conn.execute("ALTER TABLE jobs ADD COLUMN video_sas_expires_at TEXT")
+            if "caption" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN caption TEXT")
+            if "instagram_container_id" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN instagram_container_id TEXT")
+            if "instagram_media_id" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN instagram_media_id TEXT")
+            if "instagram_permalink" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN instagram_permalink TEXT")
 
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)"
@@ -80,17 +88,23 @@ class JobStore:
             )
             conn.commit()
 
-    def create_job(self, job_id: str, user_id: int, source_url: str) -> Dict[str, Any]:
-        """Registers a new job in 'pending' status."""
+    def create_job(
+        self,
+        job_id: str,
+        user_id: int,
+        source_url: str,
+        caption: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Registers a new job in 'pending' status, optionally storing pre-supplied caption."""
         now = _utc_now_iso()
         with self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO jobs (
-                    job_id, user_id, source_url, status, created_at, updated_at
-                ) VALUES (?, ?, ?, 'pending', ?, ?)
+                    job_id, user_id, source_url, status, caption, created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?, ?)
                 """,
-                (job_id, user_id, source_url, now, now),
+                (job_id, user_id, source_url, caption, now, now),
             )
             conn.commit()
         return self.get_job(job_id)  # type: ignore
@@ -262,6 +276,146 @@ class JobStore:
             conn.commit()
             return cursor.rowcount > 0
 
+    # =====================================================================
+    # Stage 6: Instagram Publishing Methods
+    # =====================================================================
+
+    def set_awaiting_caption(self, job_id: str) -> bool:
+        """Transitions job status to 'awaiting_caption'."""
+        now = _utc_now_iso()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'awaiting_caption', updated_at = ?
+                WHERE job_id = ?
+                """,
+                (now, job_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def set_job_caption(self, job_id: str, caption: str) -> bool:
+        """Updates the caption on a job without altering its status."""
+        now = _utc_now_iso()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET caption = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (caption, now, job_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_active_awaiting_caption_job(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Finds the most recent job awaiting caption for a specific user."""
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE user_id = ? AND status = 'awaiting_caption'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+
+    def start_publishing(self, job_id: str, caption: Optional[str] = None) -> bool:
+        """Transitions job to 'publishing' status, recording caption if specified."""
+        now = _utc_now_iso()
+        with self._connection() as conn:
+            if caption is not None:
+                cursor = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'publishing', caption = ?, updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (caption, now, job_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'publishing', updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (now, job_id),
+                )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def record_container_created(self, job_id: str, container_id: str) -> bool:
+        """Stores the Instagram media container ID for tracking and polling."""
+        now = _utc_now_iso()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET instagram_container_id = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (container_id, now, job_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def complete_publishing(self, job_id: str, media_id: str, permalink: str) -> bool:
+        """Marks job as 'published' and stores final media ID and public post permalink."""
+        now = _utc_now_iso()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'published',
+                    instagram_media_id = ?,
+                    instagram_permalink = ?,
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (media_id, permalink, now, job_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def fail_publishing(self, job_id: str, error_message: str) -> bool:
+        """Marks job as 'publish_failed' with error explanation."""
+        now = _utc_now_iso()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'publish_failed',
+                    error_message = ?,
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (error_message, now, job_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def count_published_in_last_24h(self) -> int:
+        """Counts how many Reels were published in the rolling last 24 hours."""
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT COUNT(*) FROM jobs
+                WHERE status = 'published' AND updated_at >= ?
+                """,
+                (cutoff,),
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+
     def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Retrieves a single job by its UUID."""
         with self._connection() as conn:
@@ -288,15 +442,15 @@ class JobStore:
 
     def recover_interrupted_jobs(self) -> List[str]:
         """
-        Recovers jobs left in 'pending', 'downloading', 'processing', or 'uploading_to_azure' states on bot restart.
-        Marks them as 'failed', 'processing_failed', or 'azure_upload_failed'.
+        Recovers jobs left in 'pending', 'downloading', 'processing', 'uploading_to_azure', or 'publishing' states on bot restart.
+        Marks them as 'failed', 'processing_failed', 'azure_upload_failed', or 'publish_failed'.
         Returns list of recovered job IDs.
         """
         recovered_ids = []
         now = _utc_now_iso()
         with self._connection() as conn:
             cursor = conn.execute(
-                "SELECT job_id, status FROM jobs WHERE status IN ('pending', 'downloading', 'processing', 'uploading_to_azure')"
+                "SELECT job_id, status FROM jobs WHERE status IN ('pending', 'downloading', 'processing', 'uploading_to_azure', 'publishing')"
             )
             rows = cursor.fetchall()
             for row in rows:
@@ -313,11 +467,12 @@ class JobStore:
                     SET status = CASE
                             WHEN status = 'processing' THEN 'processing_failed'
                             WHEN status = 'uploading_to_azure' THEN 'azure_upload_failed'
+                            WHEN status = 'publishing' THEN 'publish_failed'
                             ELSE 'failed'
                         END,
                         error_message = 'Interrupted by bot restart',
                         updated_at = ?
-                    WHERE status IN ('pending', 'downloading', 'processing', 'uploading_to_azure')
+                    WHERE status IN ('pending', 'downloading', 'processing', 'uploading_to_azure', 'publishing')
                     """,
                     (now,),
                 )

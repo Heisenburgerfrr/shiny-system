@@ -6,7 +6,7 @@ import logging
 import re
 import time
 import uuid
-from typing import Callable, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import httpx
 from azure.storage.blob import BlobServiceClient
@@ -18,6 +18,12 @@ from bot.config import config
 from bot.cover import inspect_cover_image
 from bot.db import job_store
 from bot.downloader import DownloadResult, _format_bytes, _format_seconds, downloader
+from bot.instagram_publish import (
+    InstagramPublishError,
+    InstagramRateLimitError,
+    InstagramTokenExpiredError,
+    instagram_publisher,
+)
 from bot.processor import ProcessedResult, video_processor
 
 logger = logging.getLogger("bot.handlers")
@@ -304,17 +310,41 @@ async def _run_download_background(
             )
 
             expiry_display = video_data["expires_at"][:19].replace("T", " ") + " UTC"
-            hosted_msg = (
-                f"☁️ **Public Hosting Complete (Azure Blob Storage)**\n\n"
-                f"• **Job ID**: `{job_id}`\n"
-                f"• **Title**: {result.title}\n"
-                f"• **Video Blob**: `{video_data['blob_name']}` (Verified Reachable)\n"
-                f"• **Cover Blob**: `{cover_data['blob_name']}` (Verified Reachable)\n"
-                f"• **SAS Expiry**: `{expiry_display}`\n"
-                f"• **Status**: Ready for Instagram Publishing (Stage 6)"
-            )
-            await _update_progress_message(status_msg, hosted_msg)
             logger.info("[%s] Azure public hosting pipeline completed successfully.", job_id)
+
+            # =====================================================================
+            # Stage 6: Instagram Publishing Workflow (Inline or Guided)
+            # =====================================================================
+            job = job_store.get_job(job_id)
+            existing_caption = job.get("caption") if job else None
+
+            if existing_caption:
+                # User provided inline caption alongside the YouTube link!
+                logger.info(
+                    "[%s] Pre-supplied caption detected (%d chars). Auto-publishing to Instagram...",
+                    job_id,
+                    len(existing_caption),
+                )
+                await _update_progress_message(
+                    status_msg,
+                    f"☁️ **Hosting Complete (Azure)**\n\n"
+                    f"• **Job ID**: `{job_id}`\n"
+                    f"• **Caption**: {existing_caption[:80]}...\n"
+                    f"• 🚀 Auto-launching Instagram Reels publishing..."
+                )
+                await _run_instagram_publish_background(job_id, existing_caption, status_msg)
+            else:
+                # Bare link without caption -> prompt user in Telegram
+                job_store.set_awaiting_caption(job_id)
+                prompt_msg = (
+                    f"🎬 **Video Ready for Instagram!**\n\n"
+                    f"• **Job ID**: `{job_id}`\n"
+                    f"• **Title**: {result.title}\n"
+                    f"• **Video**: `{video_data['blob_name']}` (Verified Reachable)\n\n"
+                    f"💬 **Please reply with the caption** for this Instagram Reel.\n"
+                    f"*(Or reply `/skip` to use the YouTube video title)*"
+                )
+                await _update_progress_message(status_msg, prompt_msg)
 
         except Exception as upload_exc:
             err_text = str(upload_exc)
@@ -345,35 +375,161 @@ async def _run_download_background(
         await _update_progress_message(status_msg, failure_msg)
 
 
+async def _run_instagram_publish_background(
+    job_id: str,
+    caption: str,
+    status_msg: Message,
+) -> None:
+    """Executes the 3-step Instagram Reels publishing pipeline with throttled progress updates."""
+    job_store.start_publishing(job_id, caption=caption)
+    job = job_store.get_job(job_id)
+    if not job:
+        logger.error("[%s] Job not found for publishing.", job_id)
+        return
+
+    video_sas_url = job.get("video_sas_url")
+    if not video_sas_url:
+        logger.error("[%s] No video SAS URL found on job record.", job_id)
+        job_store.fail_publishing(job_id, "Missing video SAS URL")
+        await _update_progress_message(
+            status_msg,
+            f"❌ **Publish Failed**: Missing hosted video URL for job `{job_id}`.",
+        )
+        return
+
+    cover_data = await azure_storage_manager.ensure_cover_uploaded(config.default_cover_path)
+    cover_sas_url = cover_data.get("sas_url")
+
+    last_update_time = 0.0
+
+    async def publish_progress(status_code: str, elapsed: float) -> None:
+        nonlocal last_update_time
+        now = time.monotonic()
+        if now - last_update_time >= 3.0:
+            last_update_time = now
+            msg_text = (
+                f"🚀 **Publishing Reel to Instagram...**\n\n"
+                f"• **Job ID**: `{job_id}`\n"
+                f"• **Status**: Container `{status_code}` ({int(elapsed)}s elapsed)\n"
+                f"• Meta is ingesting and rendering Reel..."
+            )
+            await _update_progress_message(status_msg, msg_text)
+
+    try:
+        publish_res = await instagram_publisher.publish_reel(
+            job_id=job_id,
+            video_url=video_sas_url,
+            caption=caption,
+            cover_url=cover_sas_url,
+            progress_callback=publish_progress,
+        )
+
+        success_msg = (
+            f"🎉 **Reel Published Successfully!**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Media ID**: `{publish_res['media_id']}`\n"
+            f"• **Post Link**: {publish_res['permalink']}\n"
+            f"• **Azure Cleanup**: Video blob removed.\n\n"
+            f"✨ [View Live Post on Instagram]({publish_res['permalink']})"
+        )
+        await _update_progress_message(status_msg, success_msg)
+        logger.info("[%s] Instagram Reel successfully published: %s", job_id, publish_res["permalink"])
+
+    except InstagramTokenExpiredError as token_err:
+        job_store.fail_publishing(job_id, str(token_err))
+        logger.critical("[%s] CRITICAL: Instagram access token has expired: %s", job_id, token_err)
+        alert_msg = (
+            f"🚨 **CRITICAL: Instagram Access Token Expired!**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Error**: Meta rejected the access token as expired or invalid.\n\n"
+            f"⚠️ **Action Required**: Please generate a new 60-day long-lived access token and update `INSTAGRAM_ACCESS_TOKEN` in your environment."
+        )
+        await _update_progress_message(status_msg, alert_msg)
+
+    except InstagramRateLimitError as rate_err:
+        job_store.fail_publishing(job_id, str(rate_err))
+        logger.warning("[%s] Instagram rate limit reached: %s", job_id, rate_err)
+        rate_msg = (
+            f"⏳ **Instagram Rate Limit Reached**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Reason**: {rate_err}\n\n"
+            f"Please wait before publishing more Reels."
+        )
+        await _update_progress_message(status_msg, rate_msg)
+
+    except Exception as exc:
+        err_msg = str(exc)
+        job_store.fail_publishing(job_id, err_msg)
+        logger.error("[%s] Instagram publishing failed: %s", job_id, err_msg, exc_info=True)
+        fail_msg = (
+            f"❌ **Instagram Publish Failed**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Reason**: {err_msg}\n\n"
+            f"Please review logs or try again."
+        )
+        await _update_progress_message(status_msg, fail_msg)
+
+
 @restricted
 async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Detects YouTube URLs in text messages from authorized users, registers
     a job in SQLite, acknowledges immediately, and begins background download.
+    Also handles replies/captions for jobs waiting in 'awaiting_caption' state.
     """
     message = update.effective_message
     if not message or not message.text:
         return
 
-    match = YOUTUBE_URL_REGEX.search(message.text)
-    if not match:
-        # Message is not a YouTube URL; ignore or let other handlers process
-        return
-
-    url = match.group(1).strip()
     user = update.effective_user
     user_id = user.id if user else 0
 
+    match = YOUTUBE_URL_REGEX.search(message.text)
+    if not match:
+        # Check if the user is replying with a caption for an active job
+        awaiting_job = job_store.get_active_awaiting_caption_job(user_id)
+        if awaiting_job:
+            caption_text = message.text.strip()
+            # If user sent /skip, default to the original YouTube video title
+            if caption_text.lower() == "/skip":
+                caption_text = awaiting_job.get("title") or "New Reel"
+
+            job_id = awaiting_job["job_id"]
+            status_msg = await message.reply_text(
+                f"📝 Caption saved for job `{job_id}`:\n\n"
+                f"_{caption_text[:120]}..._\n\n"
+                f"🚀 Launching Instagram publishing...",
+                parse_mode="Markdown",
+            )
+            asyncio.create_task(_run_instagram_publish_background(job_id, caption_text, status_msg))
+            return
+        return
+
+    url = match.group(1).strip()
+
+    # Extract inline caption (everything other than the URL)
+    # Allows sending: https://youtube.com/watch?v=xyz My multiline caption here
+    raw_text = message.text
+    caption_part = raw_text.replace(match.group(0), "").strip()
+    inline_caption = caption_part if caption_part else None
+
     # 1. Generate unique Job ID (UUID4)
     job_id = str(uuid.uuid4())
-    logger.info("New download job registered: job_id=%s, user_id=%s, url=%s", job_id, user_id, url)
+    logger.info(
+        "New download job registered: job_id=%s, user_id=%s, url=%s, has_inline_caption=%s",
+        job_id,
+        user_id,
+        url,
+        bool(inline_caption),
+    )
 
-    # 2. Persist in SQLite Job Store
-    job_store.create_job(job_id=job_id, user_id=user_id, source_url=url)
+    # 2. Persist in SQLite Job Store (with caption if provided)
+    job_store.create_job(job_id=job_id, user_id=user_id, source_url=url, caption=inline_caption)
 
     # 3. Send immediate acknowledgment message
+    caption_note = " (with custom caption)" if inline_caption else ""
     ack_text = (
-        f"📥 **Download Request Received**\n\n"
+        f"📥 **Download Request Received{caption_note}**\n\n"
         f"• **Job ID**: `{job_id}`\n"
         f"• **Status**: Connecting to YouTube..."
     )
@@ -397,7 +553,7 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 
 
 # =====================================================================
-# Stubs for Subsequent Stages
+# Public Pipeline Helpers
 # =====================================================================
 
 async def download_youtube_video(url: str, job_id: Optional[str] = None) -> DownloadResult:
@@ -426,10 +582,16 @@ async def process_video(
     )
 
 
-async def publish_to_instagram(video_url: str, caption: str, job_id: str) -> str:
+async def publish_to_instagram(video_url: str, caption: str, job_id: str) -> Dict[str, str]:
     """
-    Placeholder for uploading to Azure Blob and publishing to Instagram.
-    # TODO: Stage 5 - Implement Azure Blob upload and temporary SAS URL generation
-    # TODO: Stage 6 - Implement Instagram Graph API publishing with container creation and polling
+    Public entry point for publishing hosted video to Instagram Reels.
+    Uses InstagramPublisher implemented in Stage 6.
     """
-    raise NotImplementedError("Stage 5/6 not implemented yet.")
+    cover_data = await azure_storage_manager.ensure_cover_uploaded(config.default_cover_path)
+    return await instagram_publisher.publish_reel(
+        job_id=job_id,
+        video_url=video_url,
+        caption=caption,
+        cover_url=cover_data.get("sas_url"),
+    )
+

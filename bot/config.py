@@ -29,6 +29,8 @@ class Settings:
     ytdlp_player_clients: List[str]
     default_cover_path: Path
     azure_blob_container: str
+    instagram_caption_suffix: str
+    instagram_publish_rate_limit: int
 
 
 def _load_and_validate_settings() -> Settings:
@@ -139,6 +141,16 @@ def _load_and_validate_settings() -> Settings:
             f"Must be 3-63 lowercase alphanumeric characters or hyphens."
         )
 
+    # 12. INSTAGRAM_CAPTION_SUFFIX (Stage 6: Optional Caption Template / Suffix)
+    instagram_caption_suffix = os.getenv("INSTAGRAM_CAPTION_SUFFIX", "").strip()
+
+    # 13. INSTAGRAM_PUBLISH_RATE_LIMIT_24H (Stage 6: Meta 24h rolling post ceiling, default 50)
+    raw_rate_limit = os.getenv("INSTAGRAM_PUBLISH_RATE_LIMIT_24H", "50").strip()
+    try:
+        instagram_publish_rate_limit = int(raw_rate_limit)
+    except ValueError:
+        instagram_publish_rate_limit = 50
+
     if errors:
         error_msg = "\n".join(f"  - {err}" for err in errors)
         raise RuntimeError(
@@ -159,6 +171,8 @@ def _load_and_validate_settings() -> Settings:
         ytdlp_player_clients=ytdlp_player_clients,
         default_cover_path=default_cover_path.resolve(),
         azure_blob_container=azure_blob_container,
+        instagram_caption_suffix=instagram_caption_suffix,
+        instagram_publish_rate_limit=instagram_publish_rate_limit,
     )
 
 
@@ -177,3 +191,5 @@ YTDLP_PROXY_URL = config.ytdlp_proxy_url
 YTDLP_PLAYER_CLIENTS = config.ytdlp_player_clients
 DEFAULT_COVER_PATH = config.default_cover_path
 AZURE_BLOB_CONTAINER = config.azure_blob_container
+INSTAGRAM_CAPTION_SUFFIX = config.instagram_caption_suffix
+INSTAGRAM_PUBLISH_RATE_LIMIT = config.instagram_publish_rate_limit
