@@ -14,6 +14,7 @@ from telegram import Message, Update
 from telegram.ext import ContextTypes
 
 from bot.config import config
+from bot.cover import inspect_cover_image
 from bot.db import job_store
 from bot.downloader import DownloadResult, _format_bytes, _format_seconds, downloader
 from bot.processor import ProcessedResult, video_processor
@@ -151,14 +152,19 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     azure_ok, azure_detail = await _check_azure()
     azure_status = f"[PASS] {azure_detail}" if azure_ok else f"[FAIL] {azure_detail}"
 
-    overall_ok = ig_ok and azure_ok
+    # 4. Default Cover Image check (Stage 4)
+    cover_res = inspect_cover_image(config.default_cover_path)
+    cover_status = f"[PASS] {cover_res.details}" if cover_res.is_valid else f"[FAIL] {cover_res.details}"
+
+    overall_ok = ig_ok and azure_ok and cover_res.is_valid
     summary = "✅ All systems operational." if overall_ok else "⚠️ One or more checks failed. Review logs."
 
     report = (
         f"📊 **System Status Report**\n\n"
         f"• **Telegram Bot API**: `{tg_status}`\n"
         f"• **Instagram Graph API**: `{ig_status}`\n"
-        f"• **Azure Blob Storage**: `{azure_status}`\n\n"
+        f"• **Azure Blob Storage**: `{azure_status}`\n"
+        f"• **Default Cover Image**: `{cover_status}`\n\n"
         f"{summary}"
     )
 
@@ -276,7 +282,8 @@ async def _run_download_background(
             f"• **Duration**: `{final_duration_str}`\n"
             f"• **Size**: `{final_size_str}`\n"
             f"• **Metadata**: `Adobe Premiere Pro CC 2024 Injected`\n"
-            f"• **Status**: Ready for Instagram Publishing (Stage 4)"
+            f"• **Cover Image**: Attached (`{config.default_cover_path.name}`)\n"
+            f"• **Status**: Ready for Azure Blob Upload & Instagram Publishing (Stage 5)"
         )
         await _update_progress_message(status_msg, final_msg)
         logger.info("[%s] Memoxz video processing pipeline completed successfully.", job_id)
@@ -379,6 +386,7 @@ async def process_video(
 async def publish_to_instagram(video_url: str, caption: str, job_id: str) -> str:
     """
     Placeholder for uploading to Azure Blob and publishing to Instagram.
-    # TODO: Stage 4 - Implement Azure Blob upload and Instagram Graph API publishing
+    # TODO: Stage 5 - Implement Azure Blob upload and temporary SAS URL generation
+    # TODO: Stage 6 - Implement Instagram Graph API publishing with container creation and polling
     """
-    raise NotImplementedError("Stage 4 not implemented yet.")
+    raise NotImplementedError("Stage 5/6 not implemented yet.")

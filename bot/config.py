@@ -1,13 +1,17 @@
 """Configuration loader and environment validator."""
 
+import logging
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Set
 from dotenv import load_dotenv
 
 # Load variables from .env file if present
 load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 @dataclass(frozen=True)
@@ -22,6 +26,7 @@ class Settings:
     ytdlp_cookies_path: Optional[str]
     ytdlp_proxy_url: Optional[str]
     ytdlp_player_clients: List[str]
+    default_cover_path: Path
 
 
 def _load_and_validate_settings() -> Settings:
@@ -97,6 +102,33 @@ def _load_and_validate_settings() -> Settings:
     if not ytdlp_player_clients:
         ytdlp_player_clients = ["android", "ios", "web"]
 
+    # 10. DEFAULT_COVER_PATH (Stage 4: Fixed Default Cover Image)
+    custom_cover = os.getenv("DEFAULT_COVER_PATH", "").strip()
+    if custom_cover:
+        default_cover_path = Path(custom_cover)
+    else:
+        # Check standard locations in project root
+        if (BASE_DIR / "cover.png").exists():
+            default_cover_path = BASE_DIR / "cover.png"
+        elif (BASE_DIR / "cover.jpg").exists():
+            default_cover_path = BASE_DIR / "cover.jpg"
+        else:
+            default_cover_path = BASE_DIR / "cover.png"
+
+    if not default_cover_path.is_file():
+        errors.append(
+            f"Missing required default cover image: '{default_cover_path}' was not found. "
+            f"Please place cover.png or cover.jpg in the project root."
+        )
+    else:
+        # Validate that the image file can actually be opened
+        try:
+            from PIL import Image
+            with Image.open(default_cover_path) as img:
+                img.verify()
+        except Exception as exc:
+            errors.append(f"Default cover image '{default_cover_path}' is corrupted or unreadable: {exc}")
+
     if errors:
         error_msg = "\n".join(f"  - {err}" for err in errors)
         raise RuntimeError(
@@ -115,6 +147,7 @@ def _load_and_validate_settings() -> Settings:
         ytdlp_cookies_path=ytdlp_cookies_path,
         ytdlp_proxy_url=ytdlp_proxy_url,
         ytdlp_player_clients=ytdlp_player_clients,
+        default_cover_path=default_cover_path.resolve(),
     )
 
 
@@ -131,3 +164,4 @@ LOG_LEVEL = config.log_level
 YTDLP_COOKIES_PATH = config.ytdlp_cookies_path
 YTDLP_PROXY_URL = config.ytdlp_proxy_url
 YTDLP_PLAYER_CLIENTS = config.ytdlp_player_clients
+DEFAULT_COVER_PATH = config.default_cover_path

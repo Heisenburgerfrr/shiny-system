@@ -3,3 +3,4 @@ python-dotenv==1.0.1
 azure-storage-blob==12.24.1
 httpx==0.28.1
 yt-dlp==2025.2.19
+Pillow==11.1.0

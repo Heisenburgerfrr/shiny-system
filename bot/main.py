@@ -41,6 +41,19 @@ def main() -> None:
             recovered,
         )
 
+    # Inspect default cover image for Instagram Reels compliance
+    from bot.cover import inspect_cover_image
+    cover_res = inspect_cover_image(config.default_cover_path)
+    if cover_res.is_valid:
+        logger.info("Default cover image loaded: %s [%s]", config.default_cover_path.name, cover_res.details)
+    else:
+        logger.warning(
+            "Default cover image warning [%s]: %s (%s)",
+            config.default_cover_path.name,
+            cover_res.status_summary,
+            cover_res.details,
+        )
+
     # Build python-telegram-bot Application
     application = (
         ApplicationBuilder()
