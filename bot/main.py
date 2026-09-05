@@ -54,6 +54,16 @@ def main() -> None:
             cover_res.details,
         )
 
+    # Ensure dedicated Azure Blob Storage container exists & sweep expired blobs
+    from bot.azure_storage import azure_storage_manager
+    try:
+        azure_storage_manager.ensure_container_exists()
+        cleaned = azure_storage_manager.cleanup_expired_video_blobs()
+        if cleaned:
+            logger.info("Startup lifecycle sweep cleaned %d expired video blob(s): %s", len(cleaned), cleaned)
+    except Exception as exc:
+        logger.warning("Azure container startup initialization check encountered: %s", exc)
+
     # Build python-telegram-bot Application
     application = (
         ApplicationBuilder()

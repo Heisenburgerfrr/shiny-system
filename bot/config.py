@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ class Settings:
     ytdlp_proxy_url: Optional[str]
     ytdlp_player_clients: List[str]
     default_cover_path: Path
+    azure_blob_container: str
 
 
 def _load_and_validate_settings() -> Settings:
@@ -129,6 +131,14 @@ def _load_and_validate_settings() -> Settings:
         except Exception as exc:
             errors.append(f"Default cover image '{default_cover_path}' is corrupted or unreadable: {exc}")
 
+    # 11. AZURE_BLOB_CONTAINER (Stage 5: Dedicated Blob Container)
+    azure_blob_container = os.getenv("AZURE_BLOB_CONTAINER", "ig-uploads").strip().lower() or "ig-uploads"
+    if not re.match(r"^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])?$", azure_blob_container):
+        errors.append(
+            f"Invalid AZURE_BLOB_CONTAINER '{azure_blob_container}'. "
+            f"Must be 3-63 lowercase alphanumeric characters or hyphens."
+        )
+
     if errors:
         error_msg = "\n".join(f"  - {err}" for err in errors)
         raise RuntimeError(
@@ -148,6 +158,7 @@ def _load_and_validate_settings() -> Settings:
         ytdlp_proxy_url=ytdlp_proxy_url,
         ytdlp_player_clients=ytdlp_player_clients,
         default_cover_path=default_cover_path.resolve(),
+        azure_blob_container=azure_blob_container,
     )
 
 
@@ -165,3 +176,4 @@ YTDLP_COOKIES_PATH = config.ytdlp_cookies_path
 YTDLP_PROXY_URL = config.ytdlp_proxy_url
 YTDLP_PLAYER_CLIENTS = config.ytdlp_player_clients
 DEFAULT_COVER_PATH = config.default_cover_path
+AZURE_BLOB_CONTAINER = config.azure_blob_container

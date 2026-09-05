@@ -60,11 +60,17 @@ class JobStore:
                 )
                 """
             )
-            # Check for processing_instructions column in existing DBs
+            # Check for processing_instructions and Stage 5 columns in existing DBs
             cursor = conn.execute("PRAGMA table_info(jobs)")
             columns = [row["name"] for row in cursor.fetchall()]
             if "processing_instructions" not in columns:
                 conn.execute("ALTER TABLE jobs ADD COLUMN processing_instructions TEXT")
+            if "video_blob_name" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN video_blob_name TEXT")
+            if "video_sas_url" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN video_sas_url TEXT")
+            if "video_sas_expires_at" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN video_sas_expires_at TEXT")
 
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)"
@@ -199,6 +205,63 @@ class JobStore:
             )
             conn.commit()
 
+    def start_azure_upload(self, job_id: str) -> bool:
+        """Transitions job status to 'uploading_to_azure'."""
+        now = _utc_now_iso()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'uploading_to_azure', updated_at = ?
+                WHERE job_id = ?
+                """,
+                (now, job_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def complete_azure_upload(
+        self,
+        job_id: str,
+        blob_name: str,
+        sas_url: str,
+        expires_at: str,
+    ) -> bool:
+        """Transitions job status to 'hosted' and stores public SAS access information."""
+        now = _utc_now_iso()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'hosted',
+                    video_blob_name = ?,
+                    video_sas_url = ?,
+                    video_sas_expires_at = ?,
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (blob_name, sas_url, expires_at, now, job_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def fail_azure_upload(self, job_id: str, error_message: str) -> bool:
+        """Transitions job status to 'azure_upload_failed' with error explanation."""
+        now = _utc_now_iso()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'azure_upload_failed',
+                    error_message = ?,
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (error_message, now, job_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
     def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Retrieves a single job by its UUID."""
         with self._connection() as conn:
@@ -225,22 +288,23 @@ class JobStore:
 
     def recover_interrupted_jobs(self) -> List[str]:
         """
-        Recovers jobs left in 'pending', 'downloading', or 'processing' states on bot restart.
-        Marks them as 'failed' or 'processing_failed' and cleans up partial files.
+        Recovers jobs left in 'pending', 'downloading', 'processing', or 'uploading_to_azure' states on bot restart.
+        Marks them as 'failed', 'processing_failed', or 'azure_upload_failed'.
         Returns list of recovered job IDs.
         """
         recovered_ids = []
         now = _utc_now_iso()
         with self._connection() as conn:
             cursor = conn.execute(
-                "SELECT job_id, status FROM jobs WHERE status IN ('pending', 'downloading', 'processing')"
+                "SELECT job_id, status FROM jobs WHERE status IN ('pending', 'downloading', 'processing', 'uploading_to_azure')"
             )
             rows = cursor.fetchall()
             for row in rows:
                 jid = row["job_id"]
                 st = row["status"]
                 recovered_ids.append(jid)
-                self._cleanup_files_for_job(jid)
+                if st in ("pending", "downloading"):
+                    self._cleanup_files_for_job(jid)
 
             if recovered_ids:
                 conn.execute(
@@ -248,11 +312,12 @@ class JobStore:
                     UPDATE jobs
                     SET status = CASE
                             WHEN status = 'processing' THEN 'processing_failed'
+                            WHEN status = 'uploading_to_azure' THEN 'azure_upload_failed'
                             ELSE 'failed'
                         END,
                         error_message = 'Interrupted by bot restart',
                         updated_at = ?
-                    WHERE status IN ('pending', 'downloading', 'processing')
+                    WHERE status IN ('pending', 'downloading', 'processing', 'uploading_to_azure')
                     """,
                     (now,),
                 )

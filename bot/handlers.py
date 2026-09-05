@@ -13,6 +13,7 @@ from azure.storage.blob import BlobServiceClient
 from telegram import Message, Update
 from telegram.ext import ContextTypes
 
+from bot.azure_storage import azure_storage_manager
 from bot.config import config
 from bot.cover import inspect_cover_image
 from bot.db import job_store
@@ -55,40 +56,31 @@ def restricted(func: Callable) -> Callable:
 
 async def _check_instagram() -> Tuple[bool, str]:
     """
-    Validates Instagram Graph API credentials via a lightweight account inspection call.
-    Returns (success: bool, message: str).
+    Verifies Instagram Graph API connectivity and returns business account username.
+    Uses long-lived access token configured in INSTAGRAM_ACCESS_TOKEN.
     """
-    url = f"https://graph.facebook.com/v20.0/{config.instagram_business_account_id}"
+    url = f"https://graph.facebook.com/v21.0/{config.instagram_business_account_id}"
     params = {
         "fields": "id,username",
         "access_token": config.instagram_access_token,
     }
-
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(url, params=params)
-
-        if resp.status_code == 200:
             data = resp.json()
-            username = data.get("username", "N/A")
-            return True, f"Connected (@{username})"
-        else:
-            try:
-                err_data = resp.json().get("error", {})
-                err_msg = err_data.get("message", resp.text[:100])
-            except Exception:
-                err_msg = resp.text[:100]
-            logger.error("Instagram Graph API check failed: HTTP %s: %s", resp.status_code, err_msg)
-            return False, f"Failed (HTTP {resp.status_code}: {err_msg})"
-
+            if resp.status_code == 200 and "username" in data:
+                return True, f"Connected (@{data['username']})"
+            error_detail = data.get("error", {}).get("message", resp.text)
+            logger.error("Instagram Graph API check failed: HTTP %s: %s", resp.status_code, error_detail)
+            return False, f"Failed (HTTP {resp.status_code}: {error_detail[:80]})"
     except Exception as exc:
-        logger.error("Instagram check encountered exception: %s", exc, exc_info=True)
-        return False, f"Error ({type(exc).__name__}: {str(exc)[:100]})"
+        logger.error("Instagram Graph API check failed with exception: %s", exc)
+        return False, f"Error ({type(exc).__name__}: {str(exc)[:80]})"
 
 
 def _check_azure_sync() -> Tuple[bool, str]:
     """
-    Synchronously verifies Azure Blob Storage reachability using the connection string.
+    Synchronously verifies Azure Blob Storage reachability and container existence.
     """
     try:
         blob_service_client = BlobServiceClient.from_connection_string(
@@ -97,10 +89,14 @@ def _check_azure_sync() -> Tuple[bool, str]:
             read_timeout=5,
             retry_total=0,
         )
-        # Attempt a lightweight account info call with explicit timeout
         account_info = blob_service_client.get_account_information(timeout=5)
         sku_name = account_info.get("sku_name", "standard")
-        return True, f"Reachable (Account SKU: {sku_name})"
+        container_client = blob_service_client.get_container_client(config.azure_blob_container)
+        exists = container_client.exists(timeout=5)
+        if exists:
+            return True, f"Reachable (Account SKU: {sku_name}, Container '{config.azure_blob_container}': OK)"
+        else:
+            return False, f"Reachable (Account SKU: {sku_name}, Container '{config.azure_blob_container}': Not Found)"
     except Exception as exc:
         logger.error("Azure Blob Storage check failed: %s", exc, exc_info=True)
         return False, f"Error ({type(exc).__name__}: {str(exc)[:100]})"
@@ -274,19 +270,66 @@ async def _run_download_background(
 
         final_duration_str = _format_seconds(proc_result.duration)
         final_size_str = _format_bytes(proc_result.file_size)
-        final_msg = (
-            f"🎬 **Processing Complete (Instagram Ready)**\n\n"
-            f"• **Job ID**: `{job_id}`\n"
-            f"• **Title**: {result.title}\n"
-            f"• **Resolution**: `{proc_result.width}x{proc_result.height}`\n"
-            f"• **Duration**: `{final_duration_str}`\n"
-            f"• **Size**: `{final_size_str}`\n"
-            f"• **Metadata**: `Adobe Premiere Pro CC 2024 Injected`\n"
-            f"• **Cover Image**: Attached (`{config.default_cover_path.name}`)\n"
-            f"• **Status**: Ready for Azure Blob Upload & Instagram Publishing (Stage 5)"
-        )
-        await _update_progress_message(status_msg, final_msg)
         logger.info("[%s] Memoxz video processing pipeline completed successfully.", job_id)
+
+        # =====================================================================
+        # Stage 5: Upload to Azure Blob Storage & Generate Public SAS URLs
+        # =====================================================================
+        job_store.start_azure_upload(job_id)
+        upload_msg = (
+            f"☁️ **Uploading to Azure Blob Storage...**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Container**: `{config.azure_blob_container}`\n"
+            f"• **Video Size**: `{final_size_str}`\n"
+            f"• Generating secure SAS access for Instagram ingestion..."
+        )
+        await _update_progress_message(status_msg, upload_msg)
+
+        try:
+            # 1. Ensure cover image is hosted
+            cover_data = await azure_storage_manager.ensure_cover_uploaded(config.default_cover_path)
+
+            # 2. Upload video blob with retries and verify reachability
+            video_data = await azure_storage_manager.upload_video_blob(
+                job_id=job_id,
+                file_path=proc_result.output_path,
+            )
+
+            # 3. Transition job status to 'hosted' in SQLite
+            job_store.complete_azure_upload(
+                job_id=job_id,
+                blob_name=video_data["blob_name"],
+                sas_url=video_data["sas_url"],
+                expires_at=video_data["expires_at"],
+            )
+
+            expiry_display = video_data["expires_at"][:19].replace("T", " ") + " UTC"
+            hosted_msg = (
+                f"☁️ **Public Hosting Complete (Azure Blob Storage)**\n\n"
+                f"• **Job ID**: `{job_id}`\n"
+                f"• **Title**: {result.title}\n"
+                f"• **Video Blob**: `{video_data['blob_name']}` (Verified Reachable)\n"
+                f"• **Cover Blob**: `{cover_data['blob_name']}` (Verified Reachable)\n"
+                f"• **SAS Expiry**: `{expiry_display}`\n"
+                f"• **Status**: Ready for Instagram Publishing (Stage 6)"
+            )
+            await _update_progress_message(status_msg, hosted_msg)
+            logger.info("[%s] Azure public hosting pipeline completed successfully.", job_id)
+
+        except Exception as upload_exc:
+            err_text = str(upload_exc)
+            clean_upload_err = re.sub(r"^\[[A-Z_]+\]\s*", "", err_text)
+            job_store.fail_azure_upload(job_id, err_text)
+            logger.error("[%s] Azure Blob upload pipeline failed: %s", job_id, err_text, exc_info=True)
+
+            user_friendly_fail = (
+                f"❌ **Azure Hosting Failed**\n\n"
+                f"• **Job ID**: `{job_id}`\n"
+                f"• **Reason**: Unable to host video on Azure Blob Storage ({clean_upload_err}).\n\n"
+                f"Please verify your Azure storage credentials and network connectivity, or try again."
+            )
+            await _update_progress_message(status_msg, user_friendly_fail)
+            return
 
     except Exception as exc:
         err_msg = str(exc)
