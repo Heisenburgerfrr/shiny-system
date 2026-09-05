@@ -1,0 +1,112 @@
+"""Configuration loader and environment validator."""
+
+import os
+import sys
+from dataclasses import dataclass
+from typing import Set
+from dotenv import load_dotenv
+
+# Load variables from .env file if present
+load_dotenv()
+
+
+@dataclass(frozen=True)
+class Settings:
+    """Immutable application settings validated at startup."""
+    telegram_bot_token: str
+    allowed_telegram_user_ids: Set[int]
+    instagram_access_token: str
+    instagram_business_account_id: str
+    azure_storage_connection_string: str
+    log_level: str
+
+
+def _load_and_validate_settings() -> Settings:
+    """
+    Reads required environment variables and validates them.
+    Fails fast with a comprehensive error message listing all missing configurations.
+    """
+    errors = []
+
+    # 1. TELEGRAM_BOT_TOKEN
+    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not telegram_bot_token:
+        errors.append("Missing required environment variable: TELEGRAM_BOT_TOKEN")
+
+    # 2. ALLOWED_TELEGRAM_USER_IDS (supports ALLOWED_TELEGRAM_USERS fallback)
+    raw_user_ids = os.getenv("ALLOWED_TELEGRAM_USER_IDS") or os.getenv("ALLOWED_TELEGRAM_USERS") or ""
+    allowed_telegram_user_ids: Set[int] = set()
+
+    if not raw_user_ids.strip():
+        errors.append(
+            "Missing required environment variable: ALLOWED_TELEGRAM_USER_IDS "
+            "(comma-separated list of numeric Telegram user IDs)"
+        )
+    else:
+        for part in raw_user_ids.split(","):
+            part_clean = part.strip()
+            if not part_clean:
+                continue
+            try:
+                allowed_telegram_user_ids.add(int(part_clean))
+            except ValueError:
+                errors.append(
+                    f"Invalid user ID in ALLOWED_TELEGRAM_USER_IDS: '{part_clean}' is not a valid integer."
+                )
+
+        if not allowed_telegram_user_ids and not errors:
+            errors.append("ALLOWED_TELEGRAM_USER_IDS must contain at least one valid numeric Telegram user ID.")
+
+    # 3. INSTAGRAM_ACCESS_TOKEN
+    instagram_access_token = os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip()
+    if not instagram_access_token:
+        errors.append("Missing required environment variable: INSTAGRAM_ACCESS_TOKEN")
+
+    # 4. INSTAGRAM_BUSINESS_ACCOUNT_ID (supports INSTAGRAM_ACCOUNT_ID fallback)
+    instagram_business_account_id = (
+        os.getenv("INSTAGRAM_BUSINESS_ACCOUNT_ID") or os.getenv("INSTAGRAM_ACCOUNT_ID") or ""
+    ).strip()
+    if not instagram_business_account_id:
+        errors.append("Missing required environment variable: INSTAGRAM_BUSINESS_ACCOUNT_ID")
+
+    # 5. AZURE_STORAGE_CONNECTION_STRING
+    azure_storage_connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+    if not azure_storage_connection_string:
+        errors.append("Missing required environment variable: AZURE_STORAGE_CONNECTION_STRING")
+
+    # 6. LOG_LEVEL (optional, default INFO)
+    log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    valid_log_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+    if log_level not in valid_log_levels:
+        errors.append(
+            f"Invalid LOG_LEVEL '{log_level}'. Must be one of: {', '.join(sorted(valid_log_levels))}"
+        )
+
+    if errors:
+        error_msg = "\n".join(f"  - {err}" for err in errors)
+        raise RuntimeError(
+            f"\n[CRITICAL] Configuration validation failed at startup:\n{error_msg}\n"
+            f"Please ensure all required variables are set in your environment or .env file.\n"
+            f"Refer to .env.example for required variables."
+        )
+
+    return Settings(
+        telegram_bot_token=telegram_bot_token,
+        allowed_telegram_user_ids=allowed_telegram_user_ids,
+        instagram_access_token=instagram_access_token,
+        instagram_business_account_id=instagram_business_account_id,
+        azure_storage_connection_string=azure_storage_connection_string,
+        log_level=log_level,
+    )
+
+
+# Read once at startup
+config = _load_and_validate_settings()
+
+# Direct module-level convenience exports
+TELEGRAM_BOT_TOKEN = config.telegram_bot_token
+ALLOWED_TELEGRAM_USER_IDS = config.allowed_telegram_user_ids
+INSTAGRAM_ACCESS_TOKEN = config.instagram_access_token
+INSTAGRAM_BUSINESS_ACCOUNT_ID = config.instagram_business_account_id
+AZURE_STORAGE_CONNECTION_STRING = config.azure_storage_connection_string
+LOG_LEVEL = config.log_level

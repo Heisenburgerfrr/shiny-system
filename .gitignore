@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Environment secrets
+.env
+
+# Application logs & storage
+logs/*.log
+storage/downloads/*
+!storage/downloads/.gitkeep
+storage/processed/*
+!storage/processed/.gitkeep
+storage/temp/*
+!storage/temp/.gitkeep
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
