@@ -1,15 +1,15 @@
 # Video Processing & Instagram Publisher Telegram Bot
 
-A Telegram bot that downloads YouTube videos, processes and re-encodes them, and publishes them to Instagram, built for deployment on Microsoft Azure.
+A Telegram bot that downloads YouTube videos, processes and re-encodes them with studio-grade anti-fingerprint protection, and publishes them to Instagram, built for deployment on Microsoft Azure.
 
 ---
 
-## Current Status: Stage 2 (YouTube Download via yt-dlp) Complete
+## Current Status: Stage 3 (Memoxz Video Processing via FFmpeg) Complete
 
 - **Stage 1 (Complete)**: Bot skeleton, environment configuration, structured logging, access control, `/start`, and `/status` diagnostics.
 - **Stage 2 (Complete)**: YouTube link detection, non-blocking background downloader using `yt_dlp`, persistent SQLite job store (`storage/jobs.db`), live throttled Telegram progress edits, cloud IP workarounds (cookies, player client rotation, proxy support), error classification, and interrupted job auto-recovery.
-- **Stage 3 (Upcoming)**: Video processing & aspect ratio conversion (ffmpeg).
-- **Stage 4 (Upcoming)**: Azure Blob upload & Instagram publishing.
+- **Stage 3 (Complete)**: Memoxz studio-grade video processing engine (from `Wel/main.py`), applying anti-fingerprint visual/acoustic hash breakup, Adobe Premiere Pro CC 2024 metadata injection, CRF 17 visually lossless master quality, 320k AAC audio, real-time render progress bar to Telegram, and automated source cleanup.
+- **Stage 4 (Upcoming)**: Cover image handling & Azure Blob upload & Instagram publishing.
 
 ---
 
@@ -22,18 +22,20 @@ A Telegram bot that downloads YouTube videos, processes and re-encodes them, and
 │   ├── config.py          # Environment variable loading & validation
 │   ├── db.py              # SQLite job store (storage/jobs.db) & recovery
 │   ├── downloader.py      # yt-dlp downloader, retries, and error classification
-│   ├── handlers.py        # /start, /status, and YouTube URL download handlers
+│   ├── processor.py       # Memoxz FFmpeg engine, anti-fingerprint layer, Premiere metadata
+│   ├── handlers.py        # /start, /status, download & processing pipeline handlers
 │   ├── logger.py          # Structured logging (stdout + rotating file)
 │   └── main.py            # Entry point, polling loop, startup job recovery
 ├── logs/                  # Application logs (logs/bot.log)
 ├── storage/
 │   ├── downloads/         # Downloaded videos ({job_id}.mp4)
-│   ├── processed/         # Placeholder for Stage 3 (ffmpeg processed videos)
+│   ├── processed/         # Final processed videos ({job_id}.mp4)
 │   ├── temp/              # Placeholder for temporary working files
 │   └── jobs.db            # SQLite job state database
 ├── tests/
 │   ├── test_stage1.py     # Stage 1 verification tests
-│   └── test_stage2.py     # Stage 2 verification tests
+│   ├── test_stage2.py     # Stage 2 verification tests
+│   └── test_stage3.py     # Stage 3 verification tests
 ├── requirements.txt       # Pinned dependencies
 ├── .env.example           # Environment template
 └── README.md              # Documentation and local setup instructions
@@ -41,10 +43,38 @@ A Telegram bot that downloads YouTube videos, processes and re-encodes them, and
 
 ---
 
+## Video Processing Engine (Memoxz Anti-Fingerprint Layer)
+
+The bot integrates the high-performance Memoxz video processing pipeline:
+
+1. **Visual Hash Breakup (Anti-Fingerprint)**:
+   - Dynamic micro-zoom and even-dimension crop (`scale=trunc(iw*crop_factor/2)*2...`) ensuring hardware acceleration speed.
+   - Randomized subtle temporal noise (`noise=alls=0.8:allf=t+u`).
+   - Micro-shifts across contrast, brightness, saturation, and gamma.
+   - Micro-speed shift (`setpts=PTS/speed_factor`).
+2. **Acoustic Print Breakup**:
+   - Matching audio speed/tempo shift (`atempo=speed_factor`).
+   - Dual-band equalizer frequency adjustment (`equalizer=f=100...`, `equalizer=f=2000...`).
+   - Volume boost (`volume=1.008`).
+3. **Adobe Premiere Pro CC 2024 Metadata Injection**:
+   - Strips all original download and platform metadata (`-map_metadata -1`).
+   - Injects authentic Adobe Premiere Pro CC 2024 / Adobe Media Encoder tags, creation timestamps, and stream handlers (`VideoHandler`, `SoundHandler`).
+4. **Master Quality & Instagram Reels Optimization**:
+   - Codec: `-c:v libx264 -preset medium -crf 17` (studio master visual quality).
+   - Audio: `-c:a aac -b:a 320k` (high-fidelity audio).
+   - Pixel format: `-pix_fmt yuv420p` with `-movflags +faststart` (Instagram Reels specification).
+5. **Real-time Progress Streaming**:
+   - As FFmpeg renders the video, the Telegram status message displays a live visual progress bar:
+     `⚙️ Processing: [████████░░░░░░░░] 50% (14.2s / 28.4s) | CRF 17 Master | 320k AAC`
+6. **Automatic Cleanup**:
+   - Upon successful render and `ffprobe` verification, the raw downloaded file in `storage/downloads/` is automatically deleted to save disk space.
+
+---
+
 ## Prerequisites
 
 - **Python 3.10+** (Python 3.11 recommended)
-- **ffmpeg** installed and in system PATH (required for merging best video and audio streams into MP4)
+- **ffmpeg** and **ffprobe** installed and in system PATH
 - Telegram account & Bot Token (from [@BotFather](https://t.me/BotFather))
 - Telegram numeric user ID (from [@userinfobot](https://t.me/userinfobot))
 - Instagram Professional/Business account connected to Facebook Page with Graph API token
@@ -105,22 +135,6 @@ LOG_LEVEL=INFO
 
 ---
 
-## Cloud IP Workarounds for Azure
-
-When running `yt-dlp` from cloud datacenter IPs (like Azure App Service or VMs), YouTube often triggers bot detection ("Sign in to confirm you're not a bot" or "The page needs to be reloaded").
-
-Stage 2 incorporates 3 workarounds for this:
-1. **Cookies file (`YTDLP_COOKIES_PATH`)**:
-   - Export cookies from your logged-in browser session into Netscape format (using browser extensions like *Get cookies.txt LOCALLY*).
-   - Set `YTDLP_COOKIES_PATH=./cookies.txt` in `.env`.
-   - If the file is missing or invalid, the bot logs a warning and proceeds without crashing.
-2. **Player Client Fallback Rotation (`YTDLP_PLAYER_CLIENTS`)**:
-   - The bot automatically cycles through `android` -> `ios` -> `web` clients before giving up if bot detection occurs.
-3. **Residential Proxy (`YTDLP_PROXY_URL`)**:
-   - An optional HTTP or SOCKS5 proxy URL can be supplied to route YouTube requests through non-datacenter IPs.
-
----
-
 ## Running the Bot
 
 Run from the project root directory:
@@ -131,26 +145,12 @@ python -m bot.main
 
 ---
 
-## Bot Usage
-
-- **Download YouTube Video**:
-  - Send any YouTube URL (`https://www.youtube.com/watch?v=...`, `https://youtu.be/...`, or `https://www.youtube.com/shorts/...`).
-  - The bot immediately sends an acknowledgment with a unique `job_id`.
-  - The message dynamically updates with real-time download progress (percentage, download speed, and ETA) throttled to prevent Telegram rate limits.
-  - On completion, reports video title, duration, file size, and saves to `storage/downloads/{job_id}.mp4`.
-- `/start`: Confirms the bot is operational for authorized users.
-- `/status`: Runs diagnostics for Telegram Bot API, Instagram Graph API, and Azure Blob Storage reachability.
-
----
-
 ## Running Verification Tests
 
 Run the automated test suites:
 
 ```powershell
-# Stage 1 tests (skeleton, access control, status)
 .\venv\Scripts\python.exe tests/test_stage1.py
-
-# Stage 2 tests (job store, error classification, regex, downloader, cleanups)
 .\venv\Scripts\python.exe tests/test_stage2.py
+.\venv\Scripts\python.exe tests/test_stage3.py
 ```

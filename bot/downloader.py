@@ -182,7 +182,8 @@ class YouTubeDownloader:
         cookies_path = self._get_validated_cookies_path()
 
         ydl_opts: Dict[str, Any] = {
-            "format": "bestvideo+bestaudio/best",
+            "format": "bestvideo*+bestaudio/best",
+            "format_sort": ["res:1080", "quality", "size", "br", "fps"],
             "merge_output_format": "mp4",
             "outtmpl": output_template,
             "socket_timeout": 30,

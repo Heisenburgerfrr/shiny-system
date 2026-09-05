@@ -16,6 +16,7 @@ from telegram.ext import ContextTypes
 from bot.config import config
 from bot.db import job_store
 from bot.downloader import DownloadResult, _format_bytes, _format_seconds, downloader
+from bot.processor import ProcessedResult, video_processor
 
 logger = logging.getLogger("bot.handlers")
 
@@ -222,27 +223,71 @@ async def _run_download_background(
             progress_callback=progress_callback,
         )
 
-        # Success message
+        # Step 1 Success notification & transition to Step 2
         duration_str = _format_seconds(result.duration)
         size_str = _format_bytes(result.file_size)
-        completion_msg = (
-            f"✅ **Download Complete**\n\n"
+        logger.info("[%s] Download succeeded: '%s' (%s). Starting Memoxz processing...", job_id, result.title, size_str)
+
+        proc_start_msg = (
+            f"⚙️ **Processing Video (Memoxz Anti-Fingerprint)**\n\n"
+            f"• **Job ID**: `{job_id[:8]}...`\n"
+            f"• **Title**: {result.title}\n"
+            f"• **Status**: Initializing FFmpeg (CRF 17 Lossless | 320k AAC)..."
+        )
+        await _update_progress_message(status_msg, proc_start_msg)
+
+        # Progress callback for FFmpeg
+        last_proc_edit_time = 0.0
+        def proc_progress_callback(pct: int, curr_sec: float, total_sec: float) -> None:
+            nonlocal last_proc_edit_time
+            now = time.time()
+            if now - last_proc_edit_time >= MIN_EDIT_INTERVAL:
+                last_proc_edit_time = now
+                bar_len = 16
+                filled = int(bar_len * pct / 100)
+                bar = "█" * filled + "░" * (bar_len - filled)
+                time_info = f"{curr_sec:.1f}s / {total_sec:.1f}s" if total_sec > 0 else f"{curr_sec:.1f}s"
+                p_text = (
+                    f"⚙️ **Processing Video (Memoxz Engine)**\n\n"
+                    f"• **Job ID**: `{job_id[:8]}...`\n"
+                    f"• **Progress**: `[{bar}] {pct}%`\n"
+                    f"• **Render Time**: `{time_info}`\n"
+                    f"• **Quality**: `CRF 17 Studio Master | 320k AAC`\n"
+                    f"• **Metadata**: `Adobe Premiere Pro CC 2024`"
+                )
+                asyncio.run_coroutine_threadsafe(
+                    _update_progress_message(status_msg, p_text),
+                    loop,
+                )
+
+        proc_result = await video_processor.process_video(
+            job_id=job_id,
+            preset="balanced",
+            progress_callback=proc_progress_callback,
+        )
+
+        final_duration_str = _format_seconds(proc_result.duration)
+        final_size_str = _format_bytes(proc_result.file_size)
+        final_msg = (
+            f"🎬 **Processing Complete (Instagram Ready)**\n\n"
             f"• **Job ID**: `{job_id}`\n"
             f"• **Title**: {result.title}\n"
-            f"• **Duration**: `{duration_str}`\n"
-            f"• **File Size**: `{size_str}`\n"
-            f"• **Status**: Ready for processing (Stage 3)"
+            f"• **Resolution**: `{proc_result.width}x{proc_result.height}`\n"
+            f"• **Duration**: `{final_duration_str}`\n"
+            f"• **Size**: `{final_size_str}`\n"
+            f"• **Metadata**: `Adobe Premiere Pro CC 2024 Injected`\n"
+            f"• **Status**: Ready for Instagram Publishing (Stage 4)"
         )
-        await _update_progress_message(status_msg, completion_msg)
-        logger.info("[%s] Download pipeline succeeded for title: '%s'", job_id, result.title)
+        await _update_progress_message(status_msg, final_msg)
+        logger.info("[%s] Memoxz video processing pipeline completed successfully.", job_id)
 
     except Exception as exc:
         err_msg = str(exc)
         clean_err = re.sub(r"^\[[A-Z_]+\]\s*", "", err_msg)
-        logger.error("[%s] Background download failed: %s", job_id, err_msg)
+        logger.error("[%s] Background download/processing pipeline failed: %s", job_id, err_msg)
 
         failure_msg = (
-            f"❌ **Download Failed**\n\n"
+            f"❌ **Task Failed**\n\n"
             f"• **Job ID**: `{job_id}`\n"
             f"• **Reason**: {clean_err}\n\n"
             f"Please check the URL or try again."
@@ -314,12 +359,21 @@ async def download_youtube_video(url: str, job_id: Optional[str] = None) -> Down
     return await downloader.download(job_id=jid, url=url)
 
 
-async def process_video(input_path: str, job_id: str) -> str:
+async def process_video(
+    input_path: str,
+    job_id: str,
+    preset: str = "balanced",
+    instructions: Optional[dict] = None,
+) -> ProcessedResult:
     """
-    Placeholder for video processing and aspect ratio conversion.
-    # TODO: Stage 3 - Implement ffmpeg video processing pipeline
+    Public entry point for video processing.
+    Uses Memoxz VideoProcessor implemented in Stage 3.
     """
-    raise NotImplementedError("Stage 3 not implemented yet.")
+    return await video_processor.process_video(
+        job_id=job_id,
+        preset=preset,
+        instructions=instructions,
+    )
 
 
 async def publish_to_instagram(video_url: str, caption: str, job_id: str) -> str:
