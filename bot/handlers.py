@@ -1,6 +1,7 @@
 """Telegram command handlers, access control, diagnostic checks, and video download handlers."""
 
 import asyncio
+from datetime import datetime, timezone
 import functools
 import logging
 import re
@@ -25,6 +26,12 @@ from bot.instagram_publish import (
     instagram_publisher,
 )
 from bot.processor import ProcessedResult, video_processor
+from bot.recovery import (
+    failure_tracker,
+    startup_recovery,
+    storage_cleaner,
+    task_registry,
+)
 
 logger = logging.getLogger("bot.handlers")
 
@@ -122,9 +129,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     welcome_message = (
         "🤖 **Bot is online and operational.**\n\n"
         "Welcome! You are authorized to use this bot.\n\n"
-        "Available commands & features:\n"
-        "• Send any **YouTube link** to download the video\n"
-        "• `/status` - Verify external connections (Instagram, Azure, Telegram)"
+        "**Core Pipeline**:\n"
+        "• Send any **YouTube link** (with optional multiline caption) to process and publish to Instagram Reels.\n\n"
+        "**Operational Commands**:\n"
+        "• `/jobs` - List all in-progress jobs and elapsed time\n"
+        "• `/job <id>` - Inspect detailed telemetry and status for a job\n"
+        "• `/cancel <id>` - Abort an active job and purge local files\n"
+        "• `/retry <id>` - Resume a failed job from the failed stage\n"
+        "• `/status` - Diagnostic connection health check"
     )
     if update.effective_message:
         await update.effective_message.reply_text(welcome_message, parse_mode="Markdown")
@@ -202,6 +214,10 @@ async def _run_download_background(
     Runs the download in background, manages rate-limited Telegram edits,
     and updates SQLite job state upon completion or failure.
     """
+    current_task = asyncio.current_task()
+    if current_task:
+        task_registry.register_task(job_id, current_task)
+
     logger.info("[%s] Starting background download task for url: %s", job_id, url)
     last_edit_time = 0.0
     MIN_EDIT_INTERVAL = 1.8  # Seconds between Telegram edits to avoid 429 errors
@@ -230,6 +246,8 @@ async def _run_download_background(
             url=url,
             progress_callback=progress_callback,
         )
+
+        failure_tracker.record_success("download")
 
         # Step 1 Success notification & transition to Step 2
         duration_str = _format_seconds(result.duration)
@@ -274,6 +292,7 @@ async def _run_download_background(
             progress_callback=proc_progress_callback,
         )
 
+        failure_tracker.record_success("processing")
         final_duration_str = _format_seconds(proc_result.duration)
         final_size_str = _format_bytes(proc_result.file_size)
         logger.info("[%s] Memoxz video processing pipeline completed successfully.", job_id)
@@ -300,6 +319,8 @@ async def _run_download_background(
                 job_id=job_id,
                 file_path=proc_result.output_path,
             )
+
+            failure_tracker.record_success("azure_upload")
 
             # 3. Transition job status to 'hosted' in SQLite
             job_store.complete_azure_upload(
@@ -332,7 +353,7 @@ async def _run_download_background(
                     f"• **Caption**: {existing_caption[:80]}...\n"
                     f"• 🚀 Auto-launching Instagram Reels publishing..."
                 )
-                await _run_instagram_publish_background(job_id, existing_caption, status_msg)
+                asyncio.create_task(_run_instagram_publish_background(job_id, existing_caption, status_msg))
             else:
                 # Bare link without caption -> prompt user in Telegram
                 job_store.set_awaiting_caption(job_id)
@@ -346,33 +367,52 @@ async def _run_download_background(
                 )
                 await _update_progress_message(status_msg, prompt_msg)
 
+        except asyncio.CancelledError:
+            logger.info("[%s] Azure upload cancelled for job.", job_id)
+            storage_cleaner.cleanup_job_local_files(job_id)
+            raise
         except Exception as upload_exc:
             err_text = str(upload_exc)
             clean_upload_err = re.sub(r"^\[[A-Z_]+\]\s*", "", err_text)
             job_store.fail_azure_upload(job_id, err_text)
             logger.error("[%s] Azure Blob upload pipeline failed: %s", job_id, err_text, exc_info=True)
+            sys_alert = failure_tracker.record_failure("azure_upload", job_id, err_text)
+            storage_cleaner.cleanup_job_local_files(job_id)
 
             user_friendly_fail = (
                 f"❌ **Azure Hosting Failed**\n\n"
                 f"• **Job ID**: `{job_id}`\n"
                 f"• **Reason**: Unable to host video on Azure Blob Storage ({clean_upload_err}).\n\n"
-                f"Please verify your Azure storage credentials and network connectivity, or try again."
+                f"Please verify your Azure storage credentials and network connectivity, or try `/retry {job_id}`."
             )
+            if sys_alert:
+                user_friendly_fail += f"\n\n{sys_alert}"
             await _update_progress_message(status_msg, user_friendly_fail)
             return
 
+    except asyncio.CancelledError:
+        logger.info("[%s] Background download/processing task was cancelled.", job_id)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        raise
     except Exception as exc:
         err_msg = str(exc)
         clean_err = re.sub(r"^\[[A-Z_]+\]\s*", "", err_msg)
-        logger.error("[%s] Background download/processing pipeline failed: %s", job_id, err_msg)
+        stage = "processing" if ("processing" in err_msg.lower() or "ffmpeg" in err_msg.lower()) else "download"
+        logger.error("[%s] Background %s pipeline failed: %s", job_id, stage, err_msg)
+        sys_alert = failure_tracker.record_failure(stage, job_id, err_msg)
+        storage_cleaner.cleanup_job_local_files(job_id)
 
         failure_msg = (
             f"❌ **Task Failed**\n\n"
             f"• **Job ID**: `{job_id}`\n"
             f"• **Reason**: {clean_err}\n\n"
-            f"Please check the URL or try again."
+            f"Use `/retry {job_id}` to retry or check the URL."
         )
+        if sys_alert:
+            failure_msg += f"\n\n{sys_alert}"
         await _update_progress_message(status_msg, failure_msg)
+    finally:
+        task_registry.unregister_task(job_id)
 
 
 async def _run_instagram_publish_background(
@@ -381,16 +421,22 @@ async def _run_instagram_publish_background(
     status_msg: Message,
 ) -> None:
     """Executes the 3-step Instagram Reels publishing pipeline with throttled progress updates."""
+    current_task = asyncio.current_task()
+    if current_task:
+        task_registry.register_task(job_id, current_task)
+
     job_store.start_publishing(job_id, caption=caption)
     job = job_store.get_job(job_id)
     if not job:
         logger.error("[%s] Job not found for publishing.", job_id)
+        task_registry.unregister_task(job_id)
         return
 
     video_sas_url = job.get("video_sas_url")
     if not video_sas_url:
         logger.error("[%s] No video SAS URL found on job record.", job_id)
         job_store.fail_publishing(job_id, "Missing video SAS URL")
+        task_registry.unregister_task(job_id)
         await _update_progress_message(
             status_msg,
             f"❌ **Publish Failed**: Missing hosted video URL for job `{job_id}`.",
@@ -424,19 +470,30 @@ async def _run_instagram_publish_background(
             progress_callback=publish_progress,
         )
 
+        # Success - purge local files immediately and reset failure counters
+        storage_cleaner.cleanup_job_local_files(job_id)
+        failure_tracker.record_success("instagram_publish")
+
         success_msg = (
             f"🎉 **Reel Published Successfully!**\n\n"
             f"• **Job ID**: `{job_id}`\n"
             f"• **Media ID**: `{publish_res['media_id']}`\n"
             f"• **Post Link**: {publish_res['permalink']}\n"
-            f"• **Azure Cleanup**: Video blob removed.\n\n"
+            f"• **Storage**: Local files and Azure video blob cleaned up.\n\n"
             f"✨ [View Live Post on Instagram]({publish_res['permalink']})"
         )
         await _update_progress_message(status_msg, success_msg)
         logger.info("[%s] Instagram Reel successfully published: %s", job_id, publish_res["permalink"])
 
+    except asyncio.CancelledError:
+        logger.info("[%s] Instagram publish task was cancelled.", job_id)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        raise
+
     except InstagramTokenExpiredError as token_err:
         job_store.fail_publishing(job_id, str(token_err))
+        storage_cleaner.cleanup_job_local_files(job_id)
+        sys_alert = failure_tracker.record_failure("token", job_id, str(token_err))
         logger.critical("[%s] CRITICAL: Instagram access token has expired: %s", job_id, token_err)
         alert_msg = (
             f"🚨 **CRITICAL: Instagram Access Token Expired!**\n\n"
@@ -444,10 +501,14 @@ async def _run_instagram_publish_background(
             f"• **Error**: Meta rejected the access token as expired or invalid.\n\n"
             f"⚠️ **Action Required**: Please generate a new 60-day long-lived access token and update `INSTAGRAM_ACCESS_TOKEN` in your environment."
         )
+        if sys_alert:
+            alert_msg += f"\n\n{sys_alert}"
         await _update_progress_message(status_msg, alert_msg)
 
     except InstagramRateLimitError as rate_err:
         job_store.fail_publishing(job_id, str(rate_err))
+        storage_cleaner.cleanup_job_local_files(job_id)
+        sys_alert = failure_tracker.record_failure("instagram_publish", job_id, str(rate_err))
         logger.warning("[%s] Instagram rate limit reached: %s", job_id, rate_err)
         rate_msg = (
             f"⏳ **Instagram Rate Limit Reached**\n\n"
@@ -455,19 +516,27 @@ async def _run_instagram_publish_background(
             f"• **Reason**: {rate_err}\n\n"
             f"Please wait before publishing more Reels."
         )
+        if sys_alert:
+            rate_msg += f"\n\n{sys_alert}"
         await _update_progress_message(status_msg, rate_msg)
 
     except Exception as exc:
         err_msg = str(exc)
         job_store.fail_publishing(job_id, err_msg)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        sys_alert = failure_tracker.record_failure("instagram_publish", job_id, err_msg)
         logger.error("[%s] Instagram publishing failed: %s", job_id, err_msg, exc_info=True)
         fail_msg = (
             f"❌ **Instagram Publish Failed**\n\n"
             f"• **Job ID**: `{job_id}`\n"
             f"• **Reason**: {err_msg}\n\n"
-            f"Please review logs or try again."
+            f"Review logs or use `/retry {job_id}`."
         )
+        if sys_alert:
+            fail_msg += f"\n\n{sys_alert}"
         await _update_progress_message(status_msg, fail_msg)
+    finally:
+        task_registry.unregister_task(job_id)
 
 
 @restricted
@@ -540,16 +609,399 @@ async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     asyncio.create_task(_run_download_background(job_id, url, status_msg, loop))
 
 
+async def _resume_azure_upload(
+    job_id: str,
+    processed_path: str,
+    status_msg: Optional[Message],
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Resumes the pipeline directly from Azure upload stage, skipping download and processing."""
+    current_task = asyncio.current_task()
+    if current_task:
+        task_registry.register_task(job_id, current_task)
+
+    job_store.start_azure_upload(job_id)
+    if status_msg:
+        await _update_progress_message(
+            status_msg,
+            f"☁️ **Resuming Azure Upload**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• Using existing processed studio master.\n"
+            f"• Uploading to Azure Blob Storage...",
+        )
+
+    try:
+        await azure_storage_manager.ensure_cover_uploaded(config.default_cover_path)
+        video_data = await azure_storage_manager.upload_video_blob(
+            job_id=job_id,
+            file_path=processed_path,
+        )
+
+        failure_tracker.record_success("azure_upload")
+        job_store.complete_azure_upload(
+            job_id=job_id,
+            blob_name=video_data["blob_name"],
+            sas_url=video_data["sas_url"],
+            expires_at=video_data["expires_at"],
+        )
+
+        job = job_store.get_job(job_id)
+        existing_caption = job.get("caption") if job else None
+
+        if existing_caption:
+            if status_msg:
+                await _update_progress_message(
+                    status_msg,
+                    f"☁️ **Hosting Complete (Azure)**\n\n"
+                    f"• **Job ID**: `{job_id}`\n"
+                    f"• 🚀 Auto-launching Instagram Reels publishing...",
+                )
+            asyncio.create_task(_run_instagram_publish_background(job_id, existing_caption, status_msg))
+        else:
+            job_store.set_awaiting_caption(job_id)
+            if status_msg:
+                prompt_msg = (
+                    f"🎬 **Video Ready for Instagram!**\n\n"
+                    f"• **Job ID**: `{job_id}`\n"
+                    f"• **Video**: `{video_data['blob_name']}` (Verified Reachable)\n\n"
+                    f"💬 **Please reply with the caption** for this Instagram Reel.\n"
+                    f"*(Or reply `/skip` to use the title)*"
+                )
+                await _update_progress_message(status_msg, prompt_msg)
+
+    except asyncio.CancelledError:
+        logger.info("[%s] Resumed Azure upload task cancelled.", job_id)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        raise
+    except Exception as exc:
+        err_text = str(exc)
+        clean_err = re.sub(r"^\[[A-Z_]+\]\s*", "", err_text)
+        job_store.fail_azure_upload(job_id, err_text)
+        sys_alert = failure_tracker.record_failure("azure_upload", job_id, err_text)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        logger.error("[%s] Resumed Azure upload failed: %s", job_id, err_text)
+        if status_msg:
+            fail_msg = f"❌ **Azure Hosting Failed**: {clean_err}\n\nUse `/retry {job_id}` to try again."
+            if sys_alert:
+                fail_msg += f"\n\n{sys_alert}"
+            await _update_progress_message(status_msg, fail_msg)
+    finally:
+        task_registry.unregister_task(job_id)
+
+
+async def _resume_processing(
+    job_id: str,
+    download_path: str,
+    status_msg: Optional[Message],
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Resumes the pipeline directly from processing stage, skipping download."""
+    current_task = asyncio.current_task()
+    if current_task:
+        task_registry.register_task(job_id, current_task)
+
+    job_store.update_status(job_id, "processing")
+    if status_msg:
+        await _update_progress_message(
+            status_msg,
+            f"⚙️ **Resuming Processing (Memoxz Engine)**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• Using existing downloaded raw video.\n"
+            f"• Initializing FFmpeg render...",
+        )
+
+    last_proc_edit_time = 0.0
+    MIN_EDIT_INTERVAL = 1.8
+
+    def proc_progress_callback(pct: int, curr_sec: float, total_sec: float) -> None:
+        nonlocal last_proc_edit_time
+        now = time.time()
+        if status_msg and (now - last_proc_edit_time >= MIN_EDIT_INTERVAL):
+            last_proc_edit_time = now
+            bar_len = 16
+            filled = int(bar_len * pct / 100)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            time_info = f"{curr_sec:.1f}s / {total_sec:.1f}s" if total_sec > 0 else f"{curr_sec:.1f}s"
+            p_text = (
+                f"⚙️ **Processing Video (Memoxz Engine)**\n\n"
+                f"• **Job ID**: `{job_id[:8]}...`\n"
+                f"• **Progress**: `[{bar}] {pct}%`\n"
+                f"• **Render Time**: `{time_info}`\n"
+                f"• **Quality**: `CRF 17 Studio Master | 320k AAC`"
+            )
+            asyncio.run_coroutine_threadsafe(
+                _update_progress_message(status_msg, p_text),
+                loop,
+            )
+
+    try:
+        proc_result = await video_processor.process_video(
+            job_id=job_id,
+            preset="balanced",
+            progress_callback=proc_progress_callback,
+        )
+
+        failure_tracker.record_success("processing")
+        await _resume_azure_upload(job_id, proc_result.output_path, status_msg, loop)
+
+    except asyncio.CancelledError:
+        logger.info("[%s] Resumed processing task cancelled.", job_id)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        raise
+    except Exception as exc:
+        err_msg = str(exc)
+        job_store.fail_processing(job_id, err_msg)
+        sys_alert = failure_tracker.record_failure("processing", job_id, err_msg)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        logger.error("[%s] Resumed processing failed: %s", job_id, err_msg)
+        if status_msg:
+            fail_msg = f"❌ **Processing Failed**: {err_msg}\n\nUse `/retry {job_id}` to try again."
+            if sys_alert:
+                fail_msg += f"\n\n{sys_alert}"
+            await _update_progress_message(status_msg, fail_msg)
+    finally:
+        task_registry.unregister_task(job_id)
+
+
+# =====================================================================
+# Stage 7: Operational Commands (/jobs, /job, /cancel, /retry)
+# =====================================================================
+
+@restricted
+async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lists all active and in-progress jobs with elapsed durations."""
+    in_progress = job_store.list_in_progress_jobs()
+    if not in_progress:
+        if update.effective_message:
+            await update.effective_message.reply_text("📋 **No jobs currently in progress.**", parse_mode="Markdown")
+        return
+
+    now = datetime.now(timezone.utc)
+    lines = [f"📋 **Active In-Progress Jobs ({len(in_progress)})**:\n"]
+
+    for job in in_progress:
+        jid = job["job_id"]
+        st = job["status"]
+        title = job.get("title") or job.get("source_url") or "Unknown"
+
+        updated_at_str = job.get("updated_at") or job.get("created_at")
+        elapsed_str = ""
+        if updated_at_str:
+            try:
+                dt = datetime.fromisoformat(updated_at_str)
+                secs = max(0, int((now - dt).total_seconds()))
+                if secs < 60:
+                    elapsed_str = f"{secs}s"
+                elif secs < 3600:
+                    elapsed_str = f"{secs // 60}m {secs % 60}s"
+                else:
+                    elapsed_str = f"{secs // 3600}h {(secs % 3600) // 60}m"
+            except Exception:
+                pass
+
+        time_part = f" ({elapsed_str} in status)" if elapsed_str else ""
+        lines.append(
+            f"• `{jid[:8]}...` — **{st}**{time_part}\n"
+            f"  _{title[:45]}_\n"
+            f"  Inspect: `/job {jid}` | Cancel: `/cancel {jid}`"
+        )
+
+    if update.effective_message:
+        await update.effective_message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
+
+@restricted
+async def job_detail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Displays detailed telemetry for a specific job."""
+    if not context.args:
+        if update.effective_message:
+            await update.effective_message.reply_text("Usage: `/job <job_id>`", parse_mode="Markdown")
+        return
+
+    job_id = context.args[0].strip()
+    job = job_store.get_job(job_id)
+    if not job:
+        if update.effective_message:
+            await update.effective_message.reply_text(f"❌ Job `{job_id}` not found.", parse_mode="Markdown")
+        return
+
+    from bot.db import DOWNLOADS_DIR, PROCESSED_DIR
+    raw_exists = (DOWNLOADS_DIR / f"{job_id}.mp4").exists()
+    proc_exists = (PROCESSED_DIR / f"{job_id}.mp4").exists()
+
+    blob_name = job.get("video_blob_name") or "None"
+    sas_expiry = job.get("video_sas_expires_at") or "None"
+    err = job.get("error_message") or "None"
+    media_id = job.get("instagram_media_id") or "None"
+    permalink = job.get("instagram_permalink") or "None"
+    caption = job.get("caption")
+    caption_preview = f"_{caption[:60]}..._" if caption else "None"
+
+    is_running = task_registry.is_task_running(job_id)
+
+    report = (
+        f"🔍 **Job Details: `{job_id}`**\n\n"
+        f"• **Status**: `{job['status']}` {'(🟢 Active Task)' if is_running else ''}\n"
+        f"• **Title**: {job.get('title') or 'N/A'}\n"
+        f"• **Source URL**: {job.get('source_url') or 'N/A'}\n"
+        f"• **Raw Download On Disk**: `{'Yes' if raw_exists else 'No'}`\n"
+        f"• **Processed Master On Disk**: `{'Yes' if proc_exists else 'No'}`\n"
+        f"• **Azure Blob**: `{blob_name}`\n"
+        f"• **SAS Expiry**: `{sas_expiry}`\n"
+        f"• **Instagram Media ID**: `{media_id}`\n"
+        f"• **Instagram Link**: {permalink}\n"
+        f"• **Caption**: {caption_preview}\n"
+        f"• **Error**: `{err}`\n"
+        f"• **Created**: `{job.get('created_at')}`\n"
+        f"• **Updated**: `{job.get('updated_at')}`\n\n"
+        f"Actions: `/retry {job_id}` | `/cancel {job_id}`"
+    )
+    if update.effective_message:
+        await update.effective_message.reply_text(report, parse_mode="Markdown")
+
+
+@restricted
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancels an active or pending job and purges local files."""
+    if not context.args:
+        if update.effective_message:
+            await update.effective_message.reply_text("Usage: `/cancel <job_id>`", parse_mode="Markdown")
+        return
+
+    job_id = context.args[0].strip()
+    job = job_store.get_job(job_id)
+    if not job:
+        if update.effective_message:
+            await update.effective_message.reply_text(f"❌ Job `{job_id}` not found.", parse_mode="Markdown")
+        return
+
+    # Check if already published
+    if job.get("status") == "published":
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                f"⚠️ Cannot cancel job `{job_id}`: Reel is already published on Instagram live!",
+                parse_mode="Markdown",
+            )
+        return
+
+    # Stop active background task if running
+    task_cancelled = task_registry.cancel_task(job_id)
+
+    # Cancel in database
+    ok, msg = job_store.cancel_job(job_id)
+    storage_cleaner.cleanup_job_local_files(job_id)
+
+    # Clean Azure blob if uploaded
+    blob_name = job.get("video_blob_name")
+    if blob_name:
+        try:
+            await azure_storage_manager.delete_video_blob(blob_name)
+        except Exception as exc:
+            logger.debug("[%s] Azure blob deletion note on cancel: %s", job_id, exc)
+
+    reply_text = (
+        f"🛑 **Job Cancelled**\n\n"
+        f"• **Job ID**: `{job_id}`\n"
+        f"• **Running Task Cancelled**: `{'Yes' if task_cancelled else 'No'}`\n"
+        f"• **Local Storage**: Purged\n"
+        f"• **Status**: `cancelled`"
+    )
+    if update.effective_message:
+        await update.effective_message.reply_text(reply_text, parse_mode="Markdown")
+
+
+@restricted
+async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Intelligently resumes a failed or interrupted job from the last valid stage."""
+    if not context.args:
+        if update.effective_message:
+            await update.effective_message.reply_text("Usage: `/retry <job_id>`", parse_mode="Markdown")
+        return
+
+    job_id = context.args[0].strip()
+    job = job_store.get_job(job_id)
+    if not job:
+        if update.effective_message:
+            await update.effective_message.reply_text(f"❌ Job `{job_id}` not found.", parse_mode="Markdown")
+        return
+
+    if job.get("status") == "published":
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                f"ℹ️ Job `{job_id}` is already published to Instagram live!",
+                parse_mode="Markdown",
+            )
+        return
+
+    if task_registry.is_task_running(job_id):
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                f"⚠️ Job `{job_id}` already has an active background task running.",
+                parse_mode="Markdown",
+            )
+        return
+
+    can_resume, stage, _ = job_store.get_job_resumption_stage(job_id)
+    if not can_resume:
+        if update.effective_message:
+            await update.effective_message.reply_text(f"❌ Cannot resume job `{job_id}`: {stage}", parse_mode="Markdown")
+        return
+
+    status_msg = None
+    if update.effective_message:
+        status_msg = await update.effective_message.reply_text(
+            f"🔄 **Resuming Job `{job_id[:8]}...`**\n\n"
+            f"• **Resumption Stage**: `{stage}`\n"
+            f"• **Source**: {job.get('source_url')}\n"
+            f"• Initializing pipeline...",
+            parse_mode="Markdown",
+        )
+
+    loop = asyncio.get_running_loop()
+
+    if stage == "publish":
+        caption = job.get("caption") or job.get("title") or "New Reel"
+        job_store.reset_job_status(job_id, "hosted")
+        asyncio.create_task(_run_instagram_publish_background(job_id, caption, status_msg))
+
+    elif stage == "upload_to_azure":
+        from bot.db import PROCESSED_DIR
+        processed_file_path = str(PROCESSED_DIR / f"{job_id}.mp4")
+        job_store.reset_job_status(job_id, "processed")
+        asyncio.create_task(_resume_azure_upload(job_id, processed_file_path, status_msg, loop))
+
+    elif stage == "process":
+        from bot.db import DOWNLOADS_DIR
+        download_path = str(DOWNLOADS_DIR / f"{job_id}.mp4")
+        job_store.reset_job_status(job_id, "downloaded")
+        asyncio.create_task(_resume_processing(job_id, download_path, status_msg, loop))
+
+    else:
+        job_store.reset_job_status(job_id, "pending")
+        asyncio.create_task(_run_download_background(job_id, job["source_url"], status_msg, loop))
+
+
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Global error handler for unhandled exceptions in any handler.
-    Logs the error with traceback and ensures the bot continues running.
+    Logs the error with traceback and notifies the user without crashing the bot process.
     """
     logger.error(
         "Unhandled exception while processing Telegram update: %s",
         context.error,
         exc_info=context.error,
     )
+
+    eff_msg = getattr(update, "effective_message", None) if update else None
+    if eff_msg:
+        try:
+            await eff_msg.reply_text(
+                "⚠️ **An unexpected error occurred while processing this request.**\n\n"
+                "The bot is continuing to run and the error has been logged for review.",
+                parse_mode="Markdown",
+            )
+        except Exception as notify_exc:
+            logger.debug("Failed to send error notice to chat: %s", notify_exc)
 
 
 # =====================================================================

@@ -19,11 +19,16 @@ from bot.config import config
 from bot.db import job_store
 # 4. Import command handlers, message handlers, and error handler
 from bot.handlers import (
+    cancel_command,
     global_error_handler,
+    job_detail_command,
+    jobs_command,
+    retry_command,
     start_command,
     status_command,
     youtube_url_handler,
 )
+from bot.recovery import startup_recovery, storage_cleaner
 
 
 def main() -> None:
@@ -32,14 +37,19 @@ def main() -> None:
     logger = setup_logging(config.log_level)
     logger.info("Initializing bot with %d authorized user ID(s)...", len(config.allowed_telegram_user_ids))
 
-    # Recover any jobs interrupted during a previous run / unexpected termination
-    recovered = job_store.recover_interrupted_jobs()
+    # Stage 7: Startup recovery scan for interrupted non-terminal jobs
+    recovered = startup_recovery.scan_and_recover_jobs()
+    recovery_report = startup_recovery.format_recovery_report(recovered) if recovered else None
     if recovered:
         logger.warning(
-            "Recovered and cleaned up %d interrupted job(s) from previous session: %s",
+            "Recovered and handled %d interrupted job(s) from previous session.",
             len(recovered),
-            recovered,
         )
+
+    # Safety net retention sweep (clean unlinked files older than 48h)
+    swept_files = storage_cleaner.periodic_storage_sweep(48)
+    if swept_files:
+        logger.info("Periodic storage safety net sweep removed %d stale file(s).", len(swept_files))
 
     # Inspect default cover image for Instagram Reels compliance
     from bot.cover import inspect_cover_image
@@ -64,16 +74,30 @@ def main() -> None:
     except Exception as exc:
         logger.warning("Azure container startup initialization check encountered: %s", exc)
 
+    async def post_init(app) -> None:
+        """Sends startup recovery notifications to authorized users if any jobs were recovered."""
+        if recovery_report:
+            for uid in config.allowed_telegram_user_ids:
+                try:
+                    await app.bot.send_message(chat_id=uid, text=recovery_report, parse_mode="Markdown")
+                except Exception as exc:
+                    logger.debug("Failed to send startup recovery notice to user %s: %s", uid, exc)
+
     # Build python-telegram-bot Application
     application = (
         ApplicationBuilder()
         .token(config.telegram_bot_token)
+        .post_init(post_init)
         .build()
     )
 
     # Register command handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("jobs", jobs_command))
+    application.add_handler(CommandHandler("job", job_detail_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CommandHandler("retry", retry_command))
 
     # Register YouTube URL text message handler (filters out commands)
     application.add_handler(

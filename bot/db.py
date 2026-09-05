@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 # Base directories
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -440,6 +440,17 @@ class JobStore:
             )
             return [dict(r) for r in cursor.fetchall()]
 
+    def _cleanup_files_for_job(self, job_id: str) -> None:
+        """Helper to remove raw and processed local files for a job."""
+        for d in (DOWNLOADS_DIR, PROCESSED_DIR, STORAGE_DIR / "temp"):
+            if d.exists():
+                for f in d.glob(f"{job_id}*"):
+                    try:
+                        if f.is_file():
+                            f.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
     def recover_interrupted_jobs(self) -> List[str]:
         """
         Recovers jobs left in 'pending', 'downloading', 'processing', 'uploading_to_azure', or 'publishing' states on bot restart.
@@ -479,18 +490,103 @@ class JobStore:
                 conn.commit()
         return recovered_ids
 
-    def _cleanup_files_for_job(self, job_id: str) -> None:
-        """Removes partial files matching the job_id pattern from storage."""
-        for d in [DOWNLOADS_DIR, PROCESSED_DIR]:
-            if not d.exists():
-                continue
-            for file in d.glob(f"{job_id}.*"):
-                try:
-                    if file.is_file():
-                        file.unlink(missing_ok=True)
-                except Exception:
-                    pass
+    def list_in_progress_jobs(self) -> List[Dict[str, Any]]:
+        """Returns all jobs currently in progress (not in a terminal state)."""
+        terminal_states = (
+            "published",
+            "cancelled",
+            "failed",
+            "download_failed",
+            "processing_failed",
+            "azure_upload_failed",
+            "publish_failed",
+        )
+        placeholders = ",".join("?" for _ in terminal_states)
+        with self._connection() as conn:
+            cursor = conn.execute(
+                f"SELECT * FROM jobs WHERE status NOT IN ({placeholders}) ORDER BY created_at DESC",
+                terminal_states,
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    def cancel_job(self, job_id: str) -> Tuple[bool, str]:
+        """
+        Attempts to cancel an active job.
+        Refuses if the job has already been published to Instagram.
+        """
+        job = self.get_job(job_id)
+        if not job:
+            return False, f"Job `{job_id}` not found."
+
+        current_status = job.get("status")
+        if current_status == "published":
+            return False, "Reel is already live on Instagram and cannot be cancelled."
+
+        if current_status == "cancelled":
+            return False, "Job is already cancelled."
+
+        now = _utc_now_iso()
+        with self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'cancelled',
+                    error_message = 'Cancelled by user',
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (now, job_id),
+            )
+            conn.commit()
+
+        self._cleanup_files_for_job(job_id)
+        return True, "Job has been cancelled and local files removed."
+
+    def get_job_resumption_stage(self, job_id: str) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        Determines the appropriate pipeline stage to resume from:
+        - 'publish': if video is hosted and has SAS URL
+        - 'upload_to_azure': if processed video file exists
+        - 'process': if downloaded source file exists
+        - 'download': if no local artifacts exist
+        """
+        job = self.get_job(job_id)
+        if not job:
+            return False, "Job not found", {}
+
+        if job["status"] == "published":
+            return False, "Job is already published", job
+
+        # Check for processed video on disk
+        processed_file = PROCESSED_DIR / f"{job_id}.mp4"
+        if processed_file.exists() and processed_file.stat().st_size > 0:
+            if job.get("video_sas_url"):
+                return True, "publish", job
+            return True, "upload_to_azure", job
+
+        # Check for raw download on disk
+        download_file = DOWNLOADS_DIR / f"{job_id}.mp4"
+        if download_file.exists() and download_file.stat().st_size > 0:
+            return True, "process", job
+
+        return True, "download", job
+
+    def reset_job_status(self, job_id: str, new_status: str) -> bool:
+        """Resets job status for retry, clearing previous error message."""
+        now = _utc_now_iso()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, error_message = NULL, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (new_status, now, job_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
 
 
 # Global singleton instance
 job_store = JobStore()
+
