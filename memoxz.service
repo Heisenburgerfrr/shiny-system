@@ -1,0 +1,17 @@
+[Unit]
+Description=Memoxz YouTube to Instagram Reels Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=azureuser
+WorkingDirectory=/home/azureuser/Memoxz
+ExecStart=/home/azureuser/Memoxz/venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/azureuser/Memoxz/.env
+StandardOutput=append:/home/azureuser/Memoxz/logs/systemd_stdout.log
+StandardError=append:/home/azureuser/Memoxz/logs/systemd_stderr.log
+
+[Install]
+WantedBy=multi-user.target
