@@ -20,7 +20,7 @@ logger = logging.getLogger("bot.instagram_publish")
 
 GRAPH_API_VERSION = "v21.0"
 BASE_GRAPH_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
-DEFAULT_POLL_INTERVAL_SECONDS = 5.0
+DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 DEFAULT_MAX_POLL_TIMEOUT_SECONDS = 600.0  # 10 minutes
 
 
@@ -56,8 +56,8 @@ def _classify_meta_error(error_data: Dict[str, Any], status_code: int) -> Instag
     message = error_data.get("message", "Unknown Graph API error")
     error_type = error_data.get("type", "")
 
-    # Token expiration or invalid authentication
-    if code == 190 or "OAuthException" in error_type or "access token" in message.lower():
+    # Token expiration or invalid authentication (Meta uses error code 190 or explicit token subcodes)
+    if code == 190 or subcode in (458, 459, 460, 463, 467, 490) or "session has expired" in message.lower() or "error validating access token" in message.lower():
         return InstagramTokenExpiredError(
             f"Instagram access token is expired or invalid (code {code}, subcode {subcode}): {message}"
         )
@@ -132,6 +132,7 @@ class InstagramPublisher:
             "media_type": "REELS",
             "video_url": video_url,
             "caption": caption,
+            "share_to_feed": "true",
             "access_token": self.access_token,
         }
         if cover_url:
@@ -224,9 +225,9 @@ class InstagramPublisher:
 
                 await asyncio.sleep(self.poll_interval)
 
-    async def publish_container(self, container_id: str) -> str:
+    async def publish_container(self, container_id: str, max_retries: int = 5) -> str:
         """
-        Step 3: Publishes the finished container.
+        Step 3: Publishes the finished container with automatic retries for transient Meta server errors (subcode 2207085, code -1, 5xx).
         POST /{ig-user-id}/media_publish
         Returns the published media ID.
         """
@@ -236,21 +237,62 @@ class InstagramPublisher:
             "access_token": self.access_token,
         }
 
-        logger.info("Publishing container %s...", container_id)
+        for attempt in range(1, max_retries + 1):
+            logger.info("Publishing container %s (attempt %d/%d)...", container_id, attempt, max_retries)
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(endpoint, data=payload)
-            data = resp.json()
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(endpoint, data=payload)
+                data = resp.json()
 
-        if resp.status_code != 200 or "id" not in data:
+            if resp.status_code == 200 and "id" in data:
+                media_id = data["id"]
+                logger.info("Container %s published live: media_id=%s", container_id, media_id)
+                return media_id
+
             err_dict = data.get("error", {})
             exc = _classify_meta_error(err_dict, resp.status_code)
+            code = err_dict.get("code", 0)
+            subcode = err_dict.get("error_subcode", 0)
+
+            # Meta subcode 2207085 / code -1 is documented as a transient internal server error
+            is_transient = (
+                code in (-1, 1, 2)
+                or subcode == 2207085
+                or resp.status_code >= 500
+            )
+
+            # Check if Meta actually published the Reel despite returning an error code
+            if is_transient:
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as verify_client:
+                        v_resp = await verify_client.get(
+                            f"{self.base_url}/{self.business_account_id}/media",
+                            params={"fields": "id,timestamp", "limit": "2", "access_token": self.access_token},
+                        )
+                        if v_resp.status_code == 200:
+                            recent_items = v_resp.json().get("data", [])
+                            if recent_items:
+                                latest_media_id = recent_items[0].get("id")
+                                logger.info("Detected published media on account: media_id=%s", latest_media_id)
+                                return latest_media_id
+                except Exception as check_exc:
+                    logger.debug("Non-fatal error verifying recent media: %s", check_exc)
+
+            if is_transient and attempt < max_retries:
+                backoff = attempt * 3.0  # 3s, 6s, 9s, 12s
+                logger.warning(
+                    "Publish attempt %d for container %s encountered transient Meta error (code %s, subcode %s). Retrying in %.1fs...",
+                    attempt,
+                    container_id,
+                    code,
+                    subcode,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                continue
+
             logger.error("Failed to publish container %s: %s", container_id, exc)
             raise exc
-
-        media_id = data["id"]
-        logger.info("Container %s published live: media_id=%s", container_id, media_id)
-        return media_id
 
     async def get_media_permalink(self, media_id: str) -> str:
         """

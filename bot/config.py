@@ -100,11 +100,11 @@ def _load_and_validate_settings() -> Settings:
     # 8. YTDLP_PROXY_URL (optional)
     ytdlp_proxy_url = os.getenv("YTDLP_PROXY_URL", "").strip() or None
 
-    # 9. YTDLP_PLAYER_CLIENTS (optional, default: android,ios,web)
-    raw_clients = os.getenv("YTDLP_PLAYER_CLIENTS", "android,ios,web").strip()
+    # 9. YTDLP_PLAYER_CLIENTS (optional, default: default,ios,mweb,web,android)
+    raw_clients = os.getenv("YTDLP_PLAYER_CLIENTS", "default,ios,mweb,web,android").strip()
     ytdlp_player_clients = [c.strip() for c in raw_clients.split(",") if c.strip()]
     if not ytdlp_player_clients:
-        ytdlp_player_clients = ["android", "ios", "web"]
+        ytdlp_player_clients = ["default", "ios", "mweb", "web", "android"]
 
     # 10. DEFAULT_COVER_PATH (Stage 4: Fixed Default Cover Image)
     custom_cover = os.getenv("DEFAULT_COVER_PATH", "").strip()

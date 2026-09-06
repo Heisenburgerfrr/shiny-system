@@ -75,7 +75,36 @@ def main() -> None:
         logger.warning("Azure container startup initialization check encountered: %s", exc)
 
     async def post_init(app) -> None:
-        """Sends startup recovery notifications to authorized users if any jobs were recovered."""
+        """Configures Telegram Bot commands, descriptions, and sends startup recovery notices."""
+        from telegram import BotCommand
+
+        # 1. Register menu commands so the [/] Menu button appears beside the typing box
+        commands = [
+            BotCommand("start", "Welcome & instructions"),
+            BotCommand("status", "System & API health check"),
+            BotCommand("jobs", "List active jobs"),
+            BotCommand("cancel", "Cancel an active job"),
+            BotCommand("retry", "Retry a failed job"),
+        ]
+        try:
+            await app.bot.set_my_commands(commands)
+            logger.info("Registered %d Telegram bot commands.", len(commands))
+        except Exception as exc:
+            logger.warning("Failed to register bot commands: %s", exc)
+
+        # 2. Set bot description
+        try:
+            await app.bot.set_my_description(
+                "🎬 YouTube to Instagram Reels Publisher\n\n"
+                "Send any YouTube Shorts or video link to automatically download, optimize, and publish directly to Instagram Reels."
+            )
+            await app.bot.set_my_short_description(
+                "Automated YouTube to Instagram Reels Publisher."
+            )
+        except Exception as exc:
+            logger.debug("Non-fatal note updating bot description: %s", exc)
+
+        # 3. Send startup recovery notifications if any jobs were recovered
         if recovery_report:
             for uid in config.allowed_telegram_user_ids:
                 try:

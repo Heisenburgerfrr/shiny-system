@@ -79,6 +79,13 @@ def classify_error(exc: Exception) -> Tuple[str, str]:
             "This video is restricted or geo-blocked in the server's region.",
         )
 
+    # Format errors should not be treated as private/unavailable videos
+    if "requested format is not available" in err_str or "no video formats found" in err_str:
+        return (
+            DownloadCategory.UNKNOWN,
+            "The requested video format was not available for the selected client.",
+        )
+
     # Private or deleted or unavailable
     if any(k in err_str for k in [
         "private video",
@@ -86,7 +93,8 @@ def classify_error(exc: Exception) -> Tuple[str, str]:
         "this video has been removed",
         "has been terminated",
         "does not exist",
-        "not available",
+        "video is not available",
+        "uploader has closed their youtube account",
     ]):
         return (
             DownloadCategory.UNAVAILABLE_OR_PRIVATE,
@@ -190,12 +198,14 @@ class YouTubeDownloader:
             "quiet": True,
             "no_warnings": True,
             "nocheckcertificate": False,
-            "extractor_args": {
+        }
+
+        if player_client and player_client.lower() != "default":
+            ydl_opts["extractor_args"] = {
                 "youtube": {
                     "player_client": [player_client],
                 }
-            },
-        }
+            }
 
         if cookies_path:
             ydl_opts["cookiefile"] = cookies_path

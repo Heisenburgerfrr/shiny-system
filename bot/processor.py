@@ -31,6 +31,11 @@ class ProcessedResult:
     width: int
     height: int
 
+    @property
+    def output_path(self) -> str:
+        """Convenience alias for file_path."""
+        return self.file_path
+
 
 def get_video_info(video_path: Path) -> Dict[str, Any]:
     """
@@ -132,6 +137,9 @@ def get_filter_complex(preset: str = "balanced") -> Tuple[str, str]:
             "equalizer=f=2000:t=q:w=1:g=0.3",
             "volume=1.008",
         ]
+
+    # Ensure square pixels (SAR 1:1) strictly required by Instagram Reels specification
+    video_filters.append("setsar=1")
 
     vf = ",".join(video_filters)
     af = ",".join(audio_filters)

@@ -1,0 +1,13 @@
+services:
+  telegram-bot:
+    build: .
+    container_name: hellf-telegram-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist SQLite database, downloaded files, and logs across container restarts
+      - ./storage:/app/storage
+      - ./logs:/app/logs
+      # Optional: mount custom cover or cookies if needed
+      - ./cover.jpg:/app/cover.jpg:ro

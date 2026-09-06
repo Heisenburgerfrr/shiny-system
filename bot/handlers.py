@@ -127,16 +127,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.info("Received /start command from user_id=%s (@%s)", user.id, user.username)
 
     welcome_message = (
-        "🤖 **Bot is online and operational.**\n\n"
-        "Welcome! You are authorized to use this bot.\n\n"
-        "**Core Pipeline**:\n"
-        "• Send any **YouTube link** (with optional multiline caption) to process and publish to Instagram Reels.\n\n"
-        "**Operational Commands**:\n"
-        "• `/jobs` - List all in-progress jobs and elapsed time\n"
-        "• `/job <id>` - Inspect detailed telemetry and status for a job\n"
-        "• `/cancel <id>` - Abort an active job and purge local files\n"
-        "• `/retry <id>` - Resume a failed job from the failed stage\n"
-        "• `/status` - Diagnostic connection health check"
+        "👋 **Welcome to Reels Publisher!**\n\n"
+        "Send any **YouTube Shorts or video link** to automatically process and publish directly to your **Instagram Reels**.\n\n"
+        "💡 **How it works:**\n"
+        "• Send a link with a caption below it to auto-publish instantly.\n"
+        "• Or send just the link, and I will prompt you for a caption.\n\n"
+        "⚡ **Commands:**\n"
+        "• `/status` — Check API & service health\n"
+        "• `/jobs` — View active processing tasks\n"
+        "• `/cancel <id>` — Cancel a task\n"
+        "• `/retry <id>` — Retry a failed task"
     )
     if update.effective_message:
         await update.effective_message.reply_text(welcome_message, parse_mode="Markdown")
@@ -156,29 +156,29 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         status_msg = await update.effective_message.reply_text("⏳ Running diagnostic checks...")
 
     # 1. Telegram check (implicit pass because this handler was invoked)
-    tg_status = "[PASS] Operational"
+    tg_status = "Connected"
 
     # 2. Instagram Graph API check
     ig_ok, ig_detail = await _check_instagram()
-    ig_status = f"[PASS] {ig_detail}" if ig_ok else f"[FAIL] {ig_detail}"
+    ig_status = ig_detail if ig_ok else f"Error: {ig_detail}"
 
     # 3. Azure Blob Storage check
     azure_ok, azure_detail = await _check_azure()
-    azure_status = f"[PASS] {azure_detail}" if azure_ok else f"[FAIL] {azure_detail}"
+    azure_status = "Connected" if azure_ok else f"Error: {azure_detail}"
 
     # 4. Default Cover Image check (Stage 4)
     cover_res = inspect_cover_image(config.default_cover_path)
-    cover_status = f"[PASS] {cover_res.details}" if cover_res.is_valid else f"[FAIL] {cover_res.details}"
+    cover_status = "Ready" if cover_res.is_valid else f"Warning: {cover_res.details}"
 
     overall_ok = ig_ok and azure_ok and cover_res.is_valid
     summary = "✅ All systems operational." if overall_ok else "⚠️ One or more checks failed. Review logs."
 
     report = (
-        f"📊 **System Status Report**\n\n"
-        f"• **Telegram Bot API**: `{tg_status}`\n"
-        f"• **Instagram Graph API**: `{ig_status}`\n"
-        f"• **Azure Blob Storage**: `{azure_status}`\n"
-        f"• **Default Cover Image**: `{cover_status}`\n\n"
+        f"📊 **System Status**\n\n"
+        f"• **Telegram Bot**: `{tg_status}`\n"
+        f"• **Instagram API**: `{ig_status}`\n"
+        f"• **Azure Storage**: `{azure_status}`\n"
+        f"• **Cover Image**: `{cover_status}`\n\n"
         f"{summary}"
     )
 
@@ -227,12 +227,12 @@ async def _run_download_background(
         now = time.time()
         if now - last_edit_time >= MIN_EDIT_INTERVAL:
             last_edit_time = now
+            bar_len = 10
+            filled = int(bar_len * percent / 100)
+            bar = "█" * filled + "░" * (bar_len - filled)
             msg_text = (
-                f"📥 **Downloading YouTube Video**\n\n"
-                f"• **Job ID**: `{job_id[:8]}...`\n"
-                f"• **Progress**: `{percent:.1f}%`\n"
-                f"• **Speed**: `{speed_str}`\n"
-                f"• **ETA**: `{eta_str}`"
+                f"⚡ **Processing Reel...**\n\n"
+                f"📥 **Downloading**: `[{bar}] {percent:.0f}%` ({speed_str})"
             )
             # Schedule message update on the main event loop thread-safely
             asyncio.run_coroutine_threadsafe(
@@ -252,13 +252,12 @@ async def _run_download_background(
         # Step 1 Success notification & transition to Step 2
         duration_str = _format_seconds(result.duration)
         size_str = _format_bytes(result.file_size)
-        logger.info("[%s] Download succeeded: '%s' (%s). Starting Memoxz processing...", job_id, result.title, size_str)
+        logger.info("[%s] Download succeeded: '%s' (%s). Starting processing...", job_id, result.title, size_str)
 
         proc_start_msg = (
-            f"⚙️ **Processing Video (Memoxz Anti-Fingerprint)**\n\n"
-            f"• **Job ID**: `{job_id[:8]}...`\n"
-            f"• **Title**: {result.title}\n"
-            f"• **Status**: Initializing FFmpeg (CRF 17 Lossless | 320k AAC)..."
+            f"⚡ **Processing Reel...**\n\n"
+            f"🎬 **{result.title}**\n\n"
+            f"⚙️ Optimizing video format..."
         )
         await _update_progress_message(status_msg, proc_start_msg)
 
@@ -269,17 +268,13 @@ async def _run_download_background(
             now = time.time()
             if now - last_proc_edit_time >= MIN_EDIT_INTERVAL:
                 last_proc_edit_time = now
-                bar_len = 16
+                bar_len = 10
                 filled = int(bar_len * pct / 100)
                 bar = "█" * filled + "░" * (bar_len - filled)
-                time_info = f"{curr_sec:.1f}s / {total_sec:.1f}s" if total_sec > 0 else f"{curr_sec:.1f}s"
                 p_text = (
-                    f"⚙️ **Processing Video (Memoxz Engine)**\n\n"
-                    f"• **Job ID**: `{job_id[:8]}...`\n"
-                    f"• **Progress**: `[{bar}] {pct}%`\n"
-                    f"• **Render Time**: `{time_info}`\n"
-                    f"• **Quality**: `CRF 17 Studio Master | 320k AAC`\n"
-                    f"• **Metadata**: `Adobe Premiere Pro CC 2024`"
+                    f"⚡ **Processing Reel...**\n\n"
+                    f"🎬 **{result.title}**\n\n"
+                    f"✂️ **Rendering**: `[{bar}] {pct}%`"
                 )
                 asyncio.run_coroutine_threadsafe(
                     _update_progress_message(status_msg, p_text),
@@ -295,18 +290,16 @@ async def _run_download_background(
         failure_tracker.record_success("processing")
         final_duration_str = _format_seconds(proc_result.duration)
         final_size_str = _format_bytes(proc_result.file_size)
-        logger.info("[%s] Memoxz video processing pipeline completed successfully.", job_id)
+        logger.info("[%s] Video processing completed successfully.", job_id)
 
         # =====================================================================
         # Stage 5: Upload to Azure Blob Storage & Generate Public SAS URLs
         # =====================================================================
         job_store.start_azure_upload(job_id)
         upload_msg = (
-            f"☁️ **Uploading to Azure Blob Storage...**\n\n"
-            f"• **Job ID**: `{job_id}`\n"
-            f"• **Container**: `{config.azure_blob_container}`\n"
-            f"• **Video Size**: `{final_size_str}`\n"
-            f"• Generating secure SAS access for Instagram ingestion..."
+            f"⚡ **Processing Reel...**\n\n"
+            f"🎬 **{result.title}**\n\n"
+            f"☁️ Uploading to cloud storage..."
         )
         await _update_progress_message(status_msg, upload_msg)
 
@@ -317,7 +310,7 @@ async def _run_download_background(
             # 2. Upload video blob with retries and verify reachability
             video_data = await azure_storage_manager.upload_video_blob(
                 job_id=job_id,
-                file_path=proc_result.output_path,
+                file_path=proc_result.file_path,
             )
 
             failure_tracker.record_success("azure_upload")
@@ -348,22 +341,18 @@ async def _run_download_background(
                 )
                 await _update_progress_message(
                     status_msg,
-                    f"☁️ **Hosting Complete (Azure)**\n\n"
-                    f"• **Job ID**: `{job_id}`\n"
-                    f"• **Caption**: {existing_caption[:80]}...\n"
-                    f"• 🚀 Auto-launching Instagram Reels publishing..."
+                    f"⚡ **Publishing Reel...**\n\n"
+                    f"🎬 **{result.title}**\n\n"
+                    f"🚀 Publishing to Instagram...",
                 )
                 asyncio.create_task(_run_instagram_publish_background(job_id, existing_caption, status_msg))
             else:
                 # Bare link without caption -> prompt user in Telegram
                 job_store.set_awaiting_caption(job_id)
                 prompt_msg = (
-                    f"🎬 **Video Ready for Instagram!**\n\n"
-                    f"• **Job ID**: `{job_id}`\n"
-                    f"• **Title**: {result.title}\n"
-                    f"• **Video**: `{video_data['blob_name']}` (Verified Reachable)\n\n"
-                    f"💬 **Please reply with the caption** for this Instagram Reel.\n"
-                    f"*(Or reply `/skip` to use the YouTube video title)*"
+                    f"🎬 **Video Ready!**\n\n"
+                    f"**{result.title}**\n\n"
+                    f"💬 Send the caption for this Reel, or `/skip` to publish directly."
                 )
                 await _update_progress_message(status_msg, prompt_msg)
 
@@ -453,11 +442,11 @@ async def _run_instagram_publish_background(
         now = time.monotonic()
         if now - last_update_time >= 3.0:
             last_update_time = now
+            title = job.get("title") or "Instagram Reel"
             msg_text = (
-                f"🚀 **Publishing Reel to Instagram...**\n\n"
-                f"• **Job ID**: `{job_id}`\n"
-                f"• **Status**: Container `{status_code}` ({int(elapsed)}s elapsed)\n"
-                f"• Meta is ingesting and rendering Reel..."
+                f"⚡ **Publishing Reel...**\n\n"
+                f"🎬 **{title}**\n\n"
+                f"🚀 Rendering on Instagram ({int(elapsed)}s)..."
             )
             await _update_progress_message(status_msg, msg_text)
 
@@ -474,13 +463,11 @@ async def _run_instagram_publish_background(
         storage_cleaner.cleanup_job_local_files(job_id)
         failure_tracker.record_success("instagram_publish")
 
+        title = job.get("title") or "Instagram Reel"
         success_msg = (
-            f"🎉 **Reel Published Successfully!**\n\n"
-            f"• **Job ID**: `{job_id}`\n"
-            f"• **Media ID**: `{publish_res['media_id']}`\n"
-            f"• **Post Link**: {publish_res['permalink']}\n"
-            f"• **Storage**: Local files and Azure video blob cleaned up.\n\n"
-            f"✨ [View Live Post on Instagram]({publish_res['permalink']})"
+            f"🎉 **Reel Published!**\n\n"
+            f"🎬 **{title}**\n\n"
+            f"👉 [Watch on Instagram]({publish_res['permalink']})"
         )
         await _update_progress_message(status_msg, success_msg)
         logger.info("[%s] Instagram Reel successfully published: %s", job_id, publish_res["permalink"])
@@ -565,9 +552,8 @@ async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             job_id = awaiting_job["job_id"]
             status_msg = await message.reply_text(
-                f"📝 Caption saved for job `{job_id}`:\n\n"
-                f"_{caption_text[:120]}..._\n\n"
-                f"🚀 Launching Instagram publishing...",
+                "🚀 **Publishing Reel...**\n\n"
+                "Sending to Instagram...",
                 parse_mode="Markdown",
             )
             asyncio.create_task(_run_instagram_publish_background(job_id, caption_text, status_msg))
@@ -598,9 +584,8 @@ async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 3. Send immediate acknowledgment message
     caption_note = " (with custom caption)" if inline_caption else ""
     ack_text = (
-        f"📥 **Download Request Received{caption_note}**\n\n"
-        f"• **Job ID**: `{job_id}`\n"
-        f"• **Status**: Connecting to YouTube..."
+        f"⚡ **Processing Reel{caption_note}...**\n\n"
+        f"📥 Connecting to YouTube..."
     )
     status_msg = await message.reply_text(ack_text, parse_mode="Markdown")
 
@@ -624,10 +609,8 @@ async def _resume_azure_upload(
     if status_msg:
         await _update_progress_message(
             status_msg,
-            f"☁️ **Resuming Azure Upload**\n\n"
-            f"• **Job ID**: `{job_id}`\n"
-            f"• Using existing processed studio master.\n"
-            f"• Uploading to Azure Blob Storage...",
+            "⚡ **Resuming Upload...**\n\n"
+            "☁️ Uploading to cloud storage...",
         )
 
     try:
@@ -650,22 +633,22 @@ async def _resume_azure_upload(
 
         if existing_caption:
             if status_msg:
+                title = job.get("title") or "Instagram Reel"
                 await _update_progress_message(
                     status_msg,
-                    f"☁️ **Hosting Complete (Azure)**\n\n"
-                    f"• **Job ID**: `{job_id}`\n"
-                    f"• 🚀 Auto-launching Instagram Reels publishing...",
+                    f"⚡ **Publishing Reel...**\n\n"
+                    f"🎬 **{title}**\n\n"
+                    f"🚀 Publishing to Instagram...",
                 )
             asyncio.create_task(_run_instagram_publish_background(job_id, existing_caption, status_msg))
         else:
             job_store.set_awaiting_caption(job_id)
             if status_msg:
+                title = job.get("title") or "Video"
                 prompt_msg = (
-                    f"🎬 **Video Ready for Instagram!**\n\n"
-                    f"• **Job ID**: `{job_id}`\n"
-                    f"• **Video**: `{video_data['blob_name']}` (Verified Reachable)\n\n"
-                    f"💬 **Please reply with the caption** for this Instagram Reel.\n"
-                    f"*(Or reply `/skip` to use the title)*"
+                    f"🎬 **Video Ready!**\n\n"
+                    f"**{title}**\n\n"
+                    f"💬 Send the caption for this Reel, or `/skip` to publish directly."
                 )
                 await _update_progress_message(status_msg, prompt_msg)
 
@@ -701,13 +684,14 @@ async def _resume_processing(
         task_registry.register_task(job_id, current_task)
 
     job_store.update_status(job_id, "processing")
+    job = job_store.get_job(job_id)
+    title = job.get("title") or "Video"
     if status_msg:
         await _update_progress_message(
             status_msg,
-            f"⚙️ **Resuming Processing (Memoxz Engine)**\n\n"
-            f"• **Job ID**: `{job_id}`\n"
-            f"• Using existing downloaded raw video.\n"
-            f"• Initializing FFmpeg render...",
+            f"⚡ **Processing Reel...**\n\n"
+            f"🎬 **{title}**\n\n"
+            f"⚙️ Optimizing video format...",
         )
 
     last_proc_edit_time = 0.0
@@ -718,16 +702,13 @@ async def _resume_processing(
         now = time.time()
         if status_msg and (now - last_proc_edit_time >= MIN_EDIT_INTERVAL):
             last_proc_edit_time = now
-            bar_len = 16
+            bar_len = 10
             filled = int(bar_len * pct / 100)
             bar = "█" * filled + "░" * (bar_len - filled)
-            time_info = f"{curr_sec:.1f}s / {total_sec:.1f}s" if total_sec > 0 else f"{curr_sec:.1f}s"
             p_text = (
-                f"⚙️ **Processing Video (Memoxz Engine)**\n\n"
-                f"• **Job ID**: `{job_id[:8]}...`\n"
-                f"• **Progress**: `[{bar}] {pct}%`\n"
-                f"• **Render Time**: `{time_info}`\n"
-                f"• **Quality**: `CRF 17 Studio Master | 320k AAC`"
+                f"⚡ **Processing Reel...**\n\n"
+                f"🎬 **{title}**\n\n"
+                f"✂️ **Rendering**: `[{bar}] {pct}%`"
             )
             asyncio.run_coroutine_threadsafe(
                 _update_progress_message(status_msg, p_text),
@@ -742,7 +723,7 @@ async def _resume_processing(
         )
 
         failure_tracker.record_success("processing")
-        await _resume_azure_upload(job_id, proc_result.output_path, status_msg, loop)
+        await _resume_azure_upload(job_id, proc_result.file_path, status_msg, loop)
 
     except asyncio.CancelledError:
         logger.info("[%s] Resumed processing task cancelled.", job_id)
