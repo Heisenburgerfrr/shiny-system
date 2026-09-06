@@ -22,7 +22,9 @@ from bot.handlers import (
     callback_query_handler,
     cancel_command,
     caption_command,
+    cookies_command,
     cover_command,
+    document_upload_handler,
     global_error_handler,
     job_detail_command,
     jobs_command,
@@ -87,6 +89,7 @@ def main() -> None:
             BotCommand("start", "Welcome & instructions"),
             BotCommand("caption", "View or change default caption"),
             BotCommand("cover", "View or change Reels cover image"),
+            BotCommand("cookies", "View or update YouTube cookies.txt"),
             BotCommand("status", "System & API health check"),
             BotCommand("jobs", "List active jobs"),
             BotCommand("cancel", "Cancel an active job or prompt"),
@@ -130,6 +133,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("caption", caption_command))
     application.add_handler(CommandHandler("cover", cover_command))
+    application.add_handler(CommandHandler("cookies", cookies_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("jobs", jobs_command))
     application.add_handler(CommandHandler("job", job_detail_command))
@@ -142,6 +146,11 @@ def main() -> None:
     # Register photo / image document handler for cover image uploads
     application.add_handler(
         MessageHandler(filters.PHOTO | (filters.Document.IMAGE & (~filters.COMMAND)), photo_upload_handler)
+    )
+
+    # Register document upload handler for cookies.txt
+    application.add_handler(
+        MessageHandler(filters.Document.ALL & (~filters.COMMAND), document_upload_handler)
     )
 
     # Register YouTube URL text message handler (filters out commands)

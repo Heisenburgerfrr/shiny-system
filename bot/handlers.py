@@ -135,6 +135,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "⚡ **Commands:**\n"
         "• `/caption` — View or edit default caption template\n"
         "• `/cover` — View or update Reels cover image\n"
+        "• `/cookies` — View or update YouTube cookies.txt\n"
         "• `/status` — Check API & service health\n"
         "• `/jobs` — View active processing tasks\n"
         "• `/cancel <id>` — Cancel a task\n"
@@ -237,6 +238,72 @@ async def cover_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 @restricted
+async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handles /cookies: displays current cookies.txt status (file size, presence of login tokens)
+    or immediately updates cookies if text was passed (/cookies <pasted lines>).
+    Provides action buttons to either upload a .txt file or paste raw text.
+    """
+    message = update.effective_message
+    if not message:
+        return
+
+    # Check if arguments were passed directly: /cookies <pasted lines>
+    if message.text:
+        cmd_parts = message.text.split(None, 1)
+        if len(cmd_parts) > 1 and cmd_parts[1].strip():
+            raw_text = cmd_parts[1].strip()
+            target_path = BASE_DIR / "cookies.txt"
+            target_path.write_text(raw_text, encoding="utf-8")
+            has_auth = any(token in raw_text for token in ["LOGIN_INFO", "__Secure-3PSID", "SAPISID", "SID"])
+            size_kb = len(raw_text.encode("utf-8")) / 1024.0
+            auth_badge = "✅ Authenticated (Active login session)" if has_auth else "⚠️ Warning: No login tokens detected (Guest session)"
+            await message.reply_text(
+                f"🍪 **YouTube Cookies Updated Successfully!**\n\n"
+                f"• **Method**: Direct argument saved to `{target_path.name}`\n"
+                f"• **File Size**: `{size_kb:.1f} KB`\n"
+                f"• **Session**: {auth_badge}\n\n"
+                f"✨ All future YouTube downloads will use these cookies immediately.",
+                parse_mode="Markdown",
+            )
+            return
+
+    cookies_path = BASE_DIR / "cookies.txt"
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📤 Upload .txt File", callback_data="change_cookies_file"),
+            InlineKeyboardButton("📋 Paste Cookie Text", callback_data="change_cookies_paste"),
+        ]
+    ])
+
+    if cookies_path.is_file():
+        size_kb = cookies_path.stat().st_size / 1024.0
+        has_auth = False
+        try:
+            content = cookies_path.read_text(encoding="utf-8", errors="ignore")
+            has_auth = any(token in content for token in ["LOGIN_INFO", "__Secure-3PSID", "SAPISID", "SID"])
+        except Exception:
+            pass
+
+        auth_status = "✅ Authenticated (Active login session)" if has_auth else "⚠️ Guest / Logged-out session"
+        msg = (
+            f"🍪 **Current YouTube Cookies Status**\n\n"
+            f"• **Location**: `{cookies_path.name}`\n"
+            f"• **File Size**: `{size_kb:.1f} KB`\n"
+            f"• **Auth Status**: {auth_status}\n\n"
+            f"💡 *Choose an option below, or simply drop `cookies.txt` or paste your cookie text directly into this chat.*"
+        )
+    else:
+        msg = (
+            f"🍪 **YouTube Cookies Status**\n\n"
+            f"⚠️ `cookies.txt` is not currently present on the server.\n\n"
+            f"Send your exported `cookies.txt` file or paste the cookie text directly into this chat."
+        )
+
+    await message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+
+
+@restricted
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles inline button clicks for changing caption or cover image."""
     query = update.callback_query
@@ -256,6 +323,20 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text(
             "📸 **Send your new cover image now.**\n\n"
             "Send any photo or image. It will be automatically center-cropped to 9:16 and resized to 1080x1920 for Instagram Reels.",
+            parse_mode="Markdown",
+        )
+    elif query.data in ("change_cookies", "change_cookies_file"):
+        context.user_data["awaiting"] = "cookies"
+        await query.message.reply_text(
+            "📤 **Send your `cookies.txt` file now.**\n\n"
+            "Attach and send your exported `cookies.txt` file into this chat.",
+            parse_mode="Markdown",
+        )
+    elif query.data == "change_cookies_paste":
+        context.user_data["awaiting"] = "cookies"
+        await query.message.reply_text(
+            "📋 **Paste your cookies text now.**\n\n"
+            "Paste the Netscape-format cookie lines directly as a message into this chat.",
             parse_mode="Markdown",
         )
 
@@ -314,6 +395,79 @@ async def photo_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as exc:
         logger.error("Failed to process uploaded cover image: %s", exc, exc_info=True)
         await status_msg.edit_text(f"❌ Failed to process cover image: {exc}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@restricted
+async def document_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handles uploaded documents from authorized users.
+    Specifically validates and installs new cookies.txt files.
+    """
+    import tempfile
+    import shutil
+    message = update.effective_message
+    if not message or not message.document:
+        return
+
+    doc = message.document
+    filename = (doc.file_name or "").lower()
+
+    user_data = getattr(context, "user_data", None)
+    awaiting_cookies = isinstance(user_data, dict) and user_data.get("awaiting") == "cookies"
+
+    # Process if named cookies.txt, ends with .txt, or user clicked [Upload New cookies.txt]
+    if not (filename == "cookies.txt" or filename.endswith(".txt") or awaiting_cookies):
+        return
+
+    status_msg = await message.reply_text("⏳ Verifying and installing `cookies.txt`...")
+
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        await tg_file.download_to_drive(custom_path=tmp_path)
+
+        content = tmp_path.read_text(encoding="utf-8", errors="ignore")
+
+        # Validation: check for Netscape cookie signatures or domain names
+        is_netscape = ("# Netscape" in content or "# HTTP Cookie File" in content)
+        is_youtube = ("youtube.com" in content or "google.com" in content)
+
+        if not (is_netscape or is_youtube or "\t" in content):
+            await status_msg.edit_text(
+                "❌ **Invalid Cookies File**\n\n"
+                "The file does not appear to be a Netscape-format `cookies.txt` exported from YouTube.\n"
+                "Please export your cookies using the *Get cookies.txt LOCALLY* extension while on youtube.com."
+            )
+            return
+
+        target_path = BASE_DIR / "cookies.txt"
+        shutil.copy2(tmp_path, target_path)
+
+        # Check for authentication tokens
+        has_auth = any(token in content for token in ["LOGIN_INFO", "__Secure-3PSID", "SAPISID", "SID"])
+        size_kb = target_path.stat().st_size / 1024.0
+
+        if isinstance(user_data, dict):
+            user_data["awaiting"] = None
+
+        auth_badge = "✅ Authenticated (Active login session)" if has_auth else "⚠️ Warning: No login tokens detected (Guest session)"
+        success_msg = (
+            f"🍪 **YouTube Cookies Updated Successfully!**\n\n"
+            f"• **Destination**: `{target_path.resolve()}`\n"
+            f"• **File Size**: `{size_kb:.1f} KB`\n"
+            f"• **Session**: {auth_badge}\n\n"
+            f"✨ All future YouTube downloads will use these cookies immediately."
+        )
+        await status_msg.edit_text(success_msg, parse_mode="Markdown")
+        logger.info("Successfully updated cookies.txt via Telegram (size: %.1f KB, authenticated=%s)", size_kb, has_auth)
+
+    except Exception as exc:
+        logger.error("Failed to process uploaded cookies.txt: %s", exc, exc_info=True)
+        await status_msg.edit_text(f"❌ Failed to install cookies: {exc}")
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -728,6 +882,44 @@ async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"💡 Future Reels sent without a caption will automatically use this template.",
             parse_mode="Markdown",
         )
+        return
+
+    # 2. Check if user is sending pasted cookies text (prompted or unprompted)
+    raw_input = message.text.strip()
+    is_cookie_text = (
+        (isinstance(user_data, dict) and user_data.get("awaiting") == "cookies")
+        or raw_input.startswith(("# Netscape", "# HTTP Cookie File"))
+        or (".youtube.com\t" in raw_input)
+    )
+    if is_cookie_text:
+        if not ("youtube.com" in raw_input or "google.com" in raw_input or "# Netscape" in raw_input or "\t" in raw_input):
+            await message.reply_text(
+                "❌ **Invalid Cookies Text**\n\n"
+                "The text does not appear to contain Netscape-format YouTube cookies.\n"
+                "Please make sure it has tab-separated cookie entries.",
+                parse_mode="Markdown",
+            )
+            return
+
+        target_path = BASE_DIR / "cookies.txt"
+        target_path.write_text(raw_input, encoding="utf-8")
+
+        has_auth = any(token in raw_input for token in ["LOGIN_INFO", "__Secure-3PSID", "SAPISID", "SID"])
+        size_kb = len(raw_input.encode("utf-8")) / 1024.0
+
+        if isinstance(user_data, dict):
+            user_data["awaiting"] = None
+
+        auth_badge = "✅ Authenticated (Active login session)" if has_auth else "⚠️ Warning: No login tokens detected (Guest session)"
+        await message.reply_text(
+            f"🍪 **YouTube Cookies Updated Successfully!**\n\n"
+            f"• **Method**: Pasted text saved to `{target_path.name}`\n"
+            f"• **File Size**: `{size_kb:.1f} KB`\n"
+            f"• **Session**: {auth_badge}\n\n"
+            f"✨ All future YouTube downloads will use these cookies immediately.",
+            parse_mode="Markdown",
+        )
+        logger.info("Successfully updated cookies.txt via pasted text (size: %.1f KB, authenticated=%s)", size_kb, has_auth)
         return
 
     match = YOUTUBE_URL_REGEX.search(message.text)
