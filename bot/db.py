@@ -86,6 +86,38 @@ class JobStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs(user_id)"
             )
+            # Persistent key-value store for dynamic bot configuration (default caption, etc.)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+
+    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Fetches a persistent setting value by key, or returns default if not found."""
+        with self._connection() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            if row:
+                return row["value"]
+            return default
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Sets or updates a persistent setting in the database."""
+        now = _utc_now_iso()
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (key, value, now),
+            )
             conn.commit()
 
     def create_job(

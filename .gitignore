@@ -19,6 +19,11 @@ storage/processed/*
 !storage/processed/.gitkeep
 storage/temp/*
 !storage/temp/.gitkeep
+storage/*.db
+storage/**/*.db
+
+# Tests
+tests/
 
 # IDE / OS
 .idea/

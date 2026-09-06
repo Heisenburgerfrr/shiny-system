@@ -150,3 +150,47 @@ def inspect_cover_image(cover_path: Path) -> CoverValidationResult:
             file_size=file_size,
             file_path=path,
         )
+
+
+def crop_and_save_cover_image(
+    input_path: Path,
+    output_path: Path,
+    target_resolution: Tuple[int, int] = RECOMMENDED_RESOLUTION,
+) -> CoverValidationResult:
+    """
+    Opens any image, auto-orients EXIF, center-crops to 9:16 aspect ratio,
+    resizes to target_resolution (1080x1920), converts to RGB JPEG, and saves to output_path.
+    Returns the CoverValidationResult of the saved image.
+    """
+    from PIL import ImageOps
+
+    input_p = Path(input_path).resolve()
+    output_p = Path(output_path).resolve()
+
+    if not input_p.is_file():
+        raise FileNotFoundError(f"Source cover image not found at {input_p}")
+
+    with Image.open(input_p) as img:
+        img = ImageOps.exif_transpose(img)
+        img = img.convert("RGB")
+        w, h = img.size
+
+        target_ratio = REELS_TARGET_ASPECT_RATIO
+        current_ratio = w / h if h > 0 else target_ratio
+
+        if current_ratio > target_ratio:
+            # Too wide: crop horizontal sides
+            crop_w = int(round(h * target_ratio))
+            left = max(0, (w - crop_w) // 2)
+            img = img.crop((left, 0, left + crop_w, h))
+        elif current_ratio < target_ratio:
+            # Too tall: crop top and bottom
+            crop_h = int(round(w / target_ratio))
+            top = max(0, (h - crop_h) // 2)
+            img = img.crop((0, top, w, top + crop_h))
+
+        img = img.resize(target_resolution, Image.Resampling.LANCZOS)
+        output_p.parent.mkdir(parents=True, exist_ok=True)
+        img.save(output_p, format="JPEG", quality=95, optimize=True)
+
+    return inspect_cover_image(output_p)

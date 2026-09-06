@@ -9,7 +9,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 # 1. Initialize logging
 from bot.logger import setup_logging
@@ -19,10 +19,14 @@ from bot.config import config
 from bot.db import job_store
 # 4. Import command handlers, message handlers, and error handler
 from bot.handlers import (
+    callback_query_handler,
     cancel_command,
+    caption_command,
+    cover_command,
     global_error_handler,
     job_detail_command,
     jobs_command,
+    photo_upload_handler,
     retry_command,
     start_command,
     status_command,
@@ -81,9 +85,11 @@ def main() -> None:
         # 1. Register menu commands so the [/] Menu button appears beside the typing box
         commands = [
             BotCommand("start", "Welcome & instructions"),
+            BotCommand("caption", "View or change default caption"),
+            BotCommand("cover", "View or change Reels cover image"),
             BotCommand("status", "System & API health check"),
             BotCommand("jobs", "List active jobs"),
-            BotCommand("cancel", "Cancel an active job"),
+            BotCommand("cancel", "Cancel an active job or prompt"),
             BotCommand("retry", "Retry a failed job"),
         ]
         try:
@@ -122,11 +128,21 @@ def main() -> None:
 
     # Register command handlers
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("caption", caption_command))
+    application.add_handler(CommandHandler("cover", cover_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("jobs", jobs_command))
     application.add_handler(CommandHandler("job", job_detail_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("retry", retry_command))
+
+    # Register callback query handler for interactive buttons
+    application.add_handler(CallbackQueryHandler(callback_query_handler))
+
+    # Register photo / image document handler for cover image uploads
+    application.add_handler(
+        MessageHandler(filters.PHOTO | (filters.Document.IMAGE & (~filters.COMMAND)), photo_upload_handler)
+    )
 
     # Register YouTube URL text message handler (filters out commands)
     application.add_handler(

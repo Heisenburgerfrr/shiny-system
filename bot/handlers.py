@@ -11,12 +11,12 @@ from typing import Callable, Dict, Optional, Tuple
 
 import httpx
 from azure.storage.blob import BlobServiceClient
-from telegram import Message, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import ContextTypes
 
 from bot.azure_storage import azure_storage_manager
 from bot.config import config
-from bot.cover import inspect_cover_image
+from bot.cover import crop_and_save_cover_image, inspect_cover_image
 from bot.db import job_store
 from bot.downloader import DownloadResult, _format_bytes, _format_seconds, downloader
 from bot.instagram_publish import (
@@ -130,9 +130,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "👋 **Welcome to Reels Publisher!**\n\n"
         "Send any **YouTube Shorts or video link** to automatically process and publish directly to your **Instagram Reels**.\n\n"
         "💡 **How it works:**\n"
-        "• Send a link with a caption below it to auto-publish instantly.\n"
-        "• Or send just the link, and I will prompt you for a caption.\n\n"
+        "• Send **only a link** and the bot will automatically use your default caption template.\n"
+        "• Or send a link with a **custom caption** below it to use that caption instead.\n\n"
         "⚡ **Commands:**\n"
+        "• `/caption` — View or edit default caption template\n"
+        "• `/cover` — View or update Reels cover image\n"
         "• `/status` — Check API & service health\n"
         "• `/jobs` — View active processing tasks\n"
         "• `/cancel <id>` — Cancel a task\n"
@@ -140,6 +142,180 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
     if update.effective_message:
         await update.effective_message.reply_text(welcome_message, parse_mode="Markdown")
+
+
+DEFAULT_MEME_CAPTION = (
+    "TVT=× \n\n"
+    "TONE PIECE. \n\n"
+    "エルバフ編 最新情報を発表&最新PV公開 \n\n"
+    "オープニング主題歌&エンディング主題歌、さら \n\n"
+    "にエルバフ編の重要キャラクター \n\n"
+    "「ロキ」のキャストが決定しました"
+)
+
+
+@restricted
+async def caption_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handles /caption: displays the current default caption template,
+    or immediately updates it if arguments were provided (/caption <new text>).
+    """
+    message = update.effective_message
+    if not message:
+        return
+
+    # Check if arguments were passed directly: /caption <new text>
+    if context.args:
+        cmd_parts = message.text.split(maxsplit=1)
+        new_caption = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+        if new_caption:
+            job_store.set_setting("default_caption", new_caption)
+            context.user_data["awaiting"] = None
+            await message.reply_text(
+                f"✅ **Default caption updated!**\n\n"
+                f"📝 **New Template:**\n{new_caption}\n\n"
+                f"💡 All YouTube links sent without a custom caption will use this automatically.",
+                parse_mode="Markdown",
+            )
+            return
+
+    current = job_store.get_setting("default_caption") or DEFAULT_MEME_CAPTION
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Change Default Caption", callback_data="change_caption")]
+    ])
+
+    await message.reply_text(
+        f"📝 **Current Default Caption Template:**\n\n"
+        f"{current}\n\n"
+        f"💡 *YouTube links sent without a caption will automatically use this template.*",
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
+
+
+@restricted
+async def cover_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handles /cover: displays the current Reels cover image with resolution and specs,
+    and provides an inline button to change it.
+    """
+    message = update.effective_message
+    if not message:
+        return
+
+    cover_path = config.default_cover_path
+    cover_info = inspect_cover_image(cover_path)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🖼️ Change Cover Image", callback_data="change_cover")]
+    ])
+
+    if cover_path.exists() and cover_info.is_valid:
+        caption_text = (
+            f"🖼️ **Current Reels Cover Image**\n\n"
+            f"• **Dimensions**: `{cover_info.width}x{cover_info.height}` ({cover_info.format})\n"
+            f"• **Aspect Ratio**: 9:16 (Instagram Reels compliant)\n"
+            f"• **File Size**: `{cover_info.file_size / 1024:.1f} KB`\n\n"
+            f"💡 *Click below to upload a new cover image. It will be automatically cropped to 9:16.*"
+        )
+        with open(cover_path, "rb") as photo_f:
+            await message.reply_photo(
+                photo=photo_f,
+                caption=caption_text,
+                reply_markup=keyboard,
+                parse_mode="Markdown",
+            )
+    else:
+        await message.reply_text(
+            f"🖼️ **Reels Cover Image**\n\n"
+            f"Status: `{cover_info.status_summary}` ({cover_info.details})\n\n"
+            f"Click below to upload a new cover image.",
+            reply_markup=keyboard,
+            parse_mode="Markdown",
+        )
+
+
+@restricted
+async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles inline button clicks for changing caption or cover image."""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    if query.data == "change_caption":
+        context.user_data["awaiting"] = "caption"
+        await query.message.reply_text(
+            "✍️ **Send your new default caption now.**\n\n"
+            "Simply send your desired caption as a text message, and it will be saved as the default template for all future Reels.",
+            parse_mode="Markdown",
+        )
+    elif query.data == "change_cover":
+        context.user_data["awaiting"] = "cover"
+        await query.message.reply_text(
+            "📸 **Send your new cover image now.**\n\n"
+            "Send any photo or image. It will be automatically center-cropped to 9:16 and resized to 1080x1920 for Instagram Reels.",
+            parse_mode="Markdown",
+        )
+
+
+@restricted
+async def photo_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handles uploaded photos or images from authorized users.
+    Auto-crops to 9:16, resizes to 1080x1920, and sets as the active default cover image.
+    """
+    import tempfile
+    message = update.effective_message
+    if not message:
+        return
+
+    file_id = None
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+        file_id = message.document.file_id
+
+    if not file_id:
+        return
+
+    status_msg = await message.reply_text("⏳ Processing and optimizing cover image for Reels...")
+
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        await tg_file.download_to_drive(custom_path=tmp_path)
+
+        target_path = config.default_cover_path
+        res = crop_and_save_cover_image(tmp_path, target_path)
+
+        azure_storage_manager._cover_cache.clear()
+        context.user_data["awaiting"] = None
+
+        success_text = (
+            f"✅ **New Reels Cover Applied!**\n\n"
+            f"• **Resolution**: `{res.width}x{res.height}` (9:16)\n"
+            f"• **Format**: `{res.format}` ({res.file_size / 1024:.1f} KB)\n"
+            f"• **Optimization**: Center-cropped to 9:16 aspect ratio\n\n"
+            f"✨ All future Instagram Reels will automatically use this cover!"
+        )
+
+        with open(target_path, "rb") as photo_f:
+            await message.reply_photo(
+                photo=photo_f,
+                caption=success_text,
+                parse_mode="Markdown",
+            )
+        await status_msg.delete()
+
+    except Exception as exc:
+        logger.error("Failed to process uploaded cover image: %s", exc, exc_info=True)
+        await status_msg.edit_text(f"❌ Failed to process cover image: {exc}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 @restricted
@@ -540,6 +716,20 @@ async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     user_id = user.id if user else 0
 
+    # 1. Check if user was prompted to send a new default caption via /caption or button
+    user_data = getattr(context, "user_data", None)
+    if isinstance(user_data, dict) and user_data.get("awaiting") == "caption":
+        new_caption = message.text.strip()
+        job_store.set_setting("default_caption", new_caption)
+        user_data["awaiting"] = None
+        await message.reply_text(
+            f"✅ **Default caption updated successfully!**\n\n"
+            f"📝 **New Default Template:**\n{new_caption}\n\n"
+            f"💡 Future Reels sent without a caption will automatically use this template.",
+            parse_mode="Markdown",
+        )
+        return
+
     match = YOUTUBE_URL_REGEX.search(message.text)
     if not match:
         # Check if the user is replying with a caption for an active job
@@ -568,6 +758,11 @@ async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     caption_part = raw_text.replace(match.group(0), "").strip()
     inline_caption = caption_part if caption_part else None
 
+    # If no inline caption provided, use the configured default caption template!
+    final_caption = inline_caption
+    if not final_caption:
+        final_caption = job_store.get_setting("default_caption") or DEFAULT_MEME_CAPTION
+
     # 1. Generate unique Job ID (UUID4)
     job_id = str(uuid.uuid4())
     logger.info(
@@ -578,8 +773,8 @@ async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         bool(inline_caption),
     )
 
-    # 2. Persist in SQLite Job Store (with caption if provided)
-    job_store.create_job(job_id=job_id, user_id=user_id, source_url=url, caption=inline_caption)
+    # 2. Persist in SQLite Job Store (with final caption stored so it auto-publishes)
+    job_store.create_job(job_id=job_id, user_id=user_id, source_url=url, caption=final_caption)
 
     # 3. Send immediate acknowledgment message
     caption_note = " (with custom caption)" if inline_caption else ""
@@ -843,7 +1038,14 @@ async def job_detail_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @restricted
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cancels an active or pending job and purges local files."""
+    """Cancels an active or pending job and purges local files, or cancels pending prompt."""
+    user_data = getattr(context, "user_data", None)
+    if isinstance(user_data, dict) and user_data.get("awaiting"):
+        user_data["awaiting"] = None
+        if update.effective_message:
+            await update.effective_message.reply_text("🛑 Cancelled caption/cover update mode.")
+        return
+
     if not context.args:
         if update.effective_message:
             await update.effective_message.reply_text("Usage: `/cancel <job_id>`", parse_mode="Markdown")
