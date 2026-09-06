@@ -14,6 +14,14 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Ensure Deno runtime and system binaries are present in PATH for yt-dlp JS challenges
+_deno_dir = str(Path.home() / ".deno" / "bin")
+_extra_paths = ["/usr/local/bin", "/usr/bin", "/bin", _deno_dir]
+_curr_path = os.environ.get("PATH", "")
+_to_add = [p for p in _extra_paths if p not in _curr_path and Path(p).exists()]
+if _to_add:
+    os.environ["PATH"] = os.pathsep.join(_to_add) + os.pathsep + _curr_path
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -94,8 +102,17 @@ def _load_and_validate_settings() -> Settings:
             f"Invalid LOG_LEVEL '{log_level}'. Must be one of: {', '.join(sorted(valid_log_levels))}"
         )
 
-    # 7. YTDLP_COOKIES_PATH (optional)
-    ytdlp_cookies_path = os.getenv("YTDLP_COOKIES_PATH", "").strip() or None
+    # 7. YTDLP_COOKIES_PATH (optional, auto-detects cookies.txt in project root)
+    custom_cookies = os.getenv("YTDLP_COOKIES_PATH", "").strip()
+    if custom_cookies:
+        cookies_p = Path(custom_cookies)
+        if not cookies_p.is_absolute():
+            cookies_p = BASE_DIR / cookies_p
+        ytdlp_cookies_path = str(cookies_p.resolve()) if cookies_p.exists() else custom_cookies
+    elif (BASE_DIR / "cookies.txt").exists():
+        ytdlp_cookies_path = str((BASE_DIR / "cookies.txt").resolve())
+    else:
+        ytdlp_cookies_path = None
 
     # 8. YTDLP_PROXY_URL (optional)
     ytdlp_proxy_url = os.getenv("YTDLP_PROXY_URL", "").strip() or None

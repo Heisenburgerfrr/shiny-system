@@ -167,16 +167,27 @@ class YouTubeDownloader:
         DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
     def _get_validated_cookies_path(self) -> Optional[str]:
-        """Validates cookies path; logs warning and returns None if invalid."""
-        if not config.ytdlp_cookies_path:
-            return None
-        path = Path(config.ytdlp_cookies_path)
-        if path.is_file():
-            return str(path.resolve())
-        logger.warning(
-            "YTDLP_COOKIES_PATH is configured ('%s') but file was not found. Continuing without cookies.",
-            config.ytdlp_cookies_path,
-        )
+        """Validates cookies path; falls back to cookies.txt in project root."""
+        candidate = None
+        if config.ytdlp_cookies_path:
+            path = Path(config.ytdlp_cookies_path)
+            if not path.is_absolute():
+                path = BASE_DIR / path
+            if path.is_file():
+                candidate = path
+            else:
+                logger.warning(
+                    "YTDLP_COOKIES_PATH is configured ('%s') but file was not found.",
+                    config.ytdlp_cookies_path,
+                )
+        if not candidate:
+            default_cookies = BASE_DIR / "cookies.txt"
+            if default_cookies.is_file():
+                candidate = default_cookies
+
+        if candidate:
+            logger.info("Using YouTube cookies: %s", candidate.resolve())
+            return str(candidate.resolve())
         return None
 
     def _build_ydl_opts(
