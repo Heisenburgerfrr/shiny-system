@@ -198,6 +198,7 @@ class YouTubeDownloader:
             "quiet": True,
             "no_warnings": True,
             "nocheckcertificate": False,
+            "remote_components": ["ejs:github"],
         }
 
         if player_client and player_client.lower() != "default":

@@ -6,7 +6,14 @@ set -e
 
 echo "🚀 [1/6] Updating system packages & installing dependencies..."
 sudo apt update -y
-sudo apt install -y python3 python3-pip python3-venv ffmpeg git curl
+sudo apt install -y python3 python3-pip python3-venv ffmpeg git curl unzip
+
+# Install Deno JS runtime if not already installed (required by yt-dlp for YouTube JS challenge solving)
+if ! command -v deno &> /dev/null; then
+    echo "⚡ Installing Deno JS runtime for yt-dlp challenge solving..."
+    curl -fsSL https://deno.land/install.sh | sh
+    sudo ln -sf ~/.deno/bin/deno /usr/local/bin/deno
+fi
 
 echo "💾 [2/6] Configuring 4 GB Swap memory for FFmpeg stability..."
 if [ ! -f /swapfile ]; then
