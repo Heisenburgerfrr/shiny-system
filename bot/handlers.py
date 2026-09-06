@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 import functools
 import logging
+from pathlib import Path
 import re
 import time
 import uuid
@@ -15,7 +16,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import ContextTypes
 
 from bot.azure_storage import azure_storage_manager
-from bot.config import config
+from bot.config import BASE_DIR, config
 from bot.cover import crop_and_save_cover_image, inspect_cover_image
 from bot.db import job_store
 from bot.downloader import DownloadResult, _format_bytes, _format_seconds, downloader
