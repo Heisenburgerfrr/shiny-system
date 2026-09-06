@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -206,11 +207,27 @@ class YouTubeDownloader:
             "merge_output_format": "mp4",
             "outtmpl": output_template,
             "socket_timeout": 30,
-            "quiet": True,
-            "no_warnings": True,
+            "quiet": False,
+            "no_warnings": False,
             "nocheckcertificate": False,
             "remote_components": ["ejs:github"],
         }
+
+        # Explicitly configure Deno runtime path for yt-dlp JS challenge solving
+        deno_bin = shutil.which("deno")
+        if not deno_bin:
+            for candidate in [
+                Path.home() / ".deno" / "bin" / "deno",
+                Path("/usr/local/bin/deno"),
+                Path("/usr/bin/deno"),
+            ]:
+                if candidate.is_file():
+                    deno_bin = str(candidate)
+                    break
+
+        if deno_bin:
+            ydl_opts["js_runtimes"] = {"deno": {"path": deno_bin}}
+            logger.info("[%s] Using Deno JS runtime at: %s", job_id, deno_bin)
 
         if player_client and player_client.lower() != "default":
             ydl_opts["extractor_args"] = {
@@ -241,6 +258,9 @@ class YouTubeDownloader:
         Runs inside asyncio.to_thread to keep the event loop non-blocking.
         """
         player_clients: List[str] = list(config.ytdlp_player_clients)
+        if "default" in player_clients:
+            player_clients.remove("default")
+        player_clients.insert(0, "default")
         max_network_retries = 3
 
         last_exception: Optional[Exception] = None

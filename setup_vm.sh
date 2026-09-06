@@ -58,6 +58,7 @@ ExecStart=$SCRIPT_DIR/venv/bin/python -m bot.main
 Restart=always
 RestartSec=5
 EnvironmentFile=$SCRIPT_DIR/.env
+Environment="PATH=/home/$CURRENT_USER/.deno/bin:/usr/local/bin:/usr/bin:/bin"
 StandardOutput=append:$SCRIPT_DIR/logs/systemd_stdout.log
 StandardError=append:$SCRIPT_DIR/logs/systemd_stderr.log
 
