@@ -655,6 +655,7 @@ async def _run_download_background(
             proc_result = await video_processor.process_video(
                 job_id=job_id,
                 preset="balanced",
+                input_file=Path(result.file_path) if result.file_path else None,
                 progress_callback=proc_progress_callback,
             )
 

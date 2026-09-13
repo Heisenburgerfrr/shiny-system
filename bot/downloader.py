@@ -350,12 +350,21 @@ class YouTubeDownloader:
                         # Case A: Single video or image post
                         if len(found_files) == 1:
                             single_file = found_files[0]
-                            file_size = single_file.stat().st_size
+                            # Move to DOWNLOADS_DIR / f"{job_id}{single_file.suffix}" for standard flat file compatibility
+                            dest_file = DOWNLOADS_DIR / f"{job_id}{single_file.suffix}"
+                            try:
+                                shutil.move(str(single_file), str(dest_file))
+                                shutil.rmtree(job_dir, ignore_errors=True)
+                            except Exception as move_err:
+                                logger.warning("[%s] Failed to move single Instagram file to root: %s", job_id, move_err)
+                                dest_file = single_file
+
+                            file_size = dest_file.stat().st_size
                             return DownloadResult(
                                 job_id=job_id,
                                 title=title,
                                 duration=duration,
-                                file_path=str(single_file.resolve()),
+                                file_path=str(dest_file.resolve()),
                                 file_size=file_size,
                                 is_carousel=False,
                             )

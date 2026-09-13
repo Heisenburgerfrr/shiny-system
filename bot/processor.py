@@ -181,8 +181,13 @@ class VideoProcessor:
         else:
             input_path = DOWNLOADS_DIR / f"{job_id}.mp4"
             if not input_path.exists():
-                # Look for any candidate
+                # Look for any candidate directly in DOWNLOADS_DIR
                 candidates = list(DOWNLOADS_DIR.glob(f"{job_id}.*"))
+                # Also check inside DOWNLOADS_DIR / job_id directory
+                job_dir = DOWNLOADS_DIR / job_id
+                if job_dir.is_dir():
+                    candidates.extend([f for f in job_dir.iterdir() if f.is_file()])
+
                 valid = [c for c in candidates if not c.name.endswith((".part", ".ytdl"))]
                 if valid:
                     input_path = valid[0]
