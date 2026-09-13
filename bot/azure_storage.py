@@ -34,6 +34,8 @@ logger = logging.getLogger("bot.azure_storage")
 DEFAULT_VIDEO_SAS_EXPIRY_HOURS = 4
 DEFAULT_COVER_SAS_EXPIRY_HOURS = 24
 DEFAULT_RETENTION_HOURS = 24
+MAX_UPLOAD_RETRIES = 3
+INITIAL_RETRY_BACKOFF_SECONDS = 2.0
 
 
 class AzureStorageManager:
@@ -155,54 +157,57 @@ class AzureStorageManager:
         except Exception as exc:
             return False, f"Reachability check error: {exc}"
 
-    async def upload_video_blob(
+    async def upload_media_blob(
         self,
         job_id: str,
-        file_path: Path,
-        max_retries: int = 3,
-        initial_backoff: float = 1.0,
+        file_path: str,
+        blob_name: Optional[str] = None,
+        content_type: Optional[str] = None,
         expiry_hours: int = DEFAULT_VIDEO_SAS_EXPIRY_HOURS,
+        max_retries: int = MAX_UPLOAD_RETRIES,
+        initial_backoff: float = INITIAL_RETRY_BACKOFF_SECONDS,
     ) -> Dict[str, Any]:
         """
-        Uploads a processed video file as '{job_id}.mp4' to Azure Blob Storage:
-        - Uploads with retries and exponential backoff
-        - Sets video/mp4 MIME content settings
-        - Validates uploaded blob size matches local file size
-        - Generates 4-hour read-only SAS URL
-        - Validates external public reachability via HTTP HEAD
-        Returns metadata dict containing blob_name, sas_url, expires_at, and size.
+        Uploads a media file (video or image) to dedicated Azure Blob Storage container.
         """
         path = Path(file_path).resolve()
         if not path.is_file():
-            raise FileNotFoundError(f"Video file not found at {path}")
+            raise FileNotFoundError(f"Media file not found at {path}")
 
         local_size = path.stat().st_size
         if local_size == 0:
-            raise ValueError(f"Video file is empty (0 bytes): {path}")
+            raise ValueError(f"Media file is empty (0 bytes): {path}")
 
-        blob_name = f"{job_id}.mp4"
+        if not blob_name:
+            ext = path.suffix.lower() or ".mp4"
+            blob_name = f"{job_id}{ext}"
+
+        if not content_type:
+            ext = path.suffix.lower()
+            content_type = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png" if ext == ".png" else "video/mp4"
+
         blob_client = self.container_client.get_blob_client(blob_name)
 
         last_exc: Optional[Exception] = None
         for attempt in range(1, max_retries + 1):
             try:
                 logger.info(
-                    "[%s] Uploading video to Azure Blob '%s' (attempt %d/%d, %d bytes)...",
+                    "[%s] Uploading media to Azure Blob '%s' (attempt %d/%d, %d bytes, type=%s)...",
                     job_id,
                     blob_name,
                     attempt,
                     max_retries,
                     local_size,
+                    content_type,
                 )
                 with open(path, "rb") as f:
-                    # Run synchronous upload in thread pool to avoid blocking asyncio event loop
                     await asyncio.to_thread(
                         blob_client.upload_blob,
                         f,
                         overwrite=True,
-                        content_settings=ContentSettings(content_type="video/mp4"),
+                        content_settings=ContentSettings(content_type=content_type),
                     )
-                logger.info("[%s] Video upload to Azure Blob '%s' finished.", job_id, blob_name)
+                logger.info("[%s] Media upload to Azure Blob '%s' finished.", job_id, blob_name)
                 break
             except Exception as exc:
                 last_exc = exc
@@ -218,7 +223,7 @@ class AzureStorageManager:
                     await asyncio.sleep(backoff)
                 else:
                     raise RuntimeError(
-                        f"Failed to upload video to Azure after {max_retries} attempts: {last_exc}"
+                        f"Failed to upload media to Azure after {max_retries} attempts: {last_exc}"
                     ) from last_exc
 
         # Verify blob existence and size
@@ -238,16 +243,16 @@ class AzureStorageManager:
         reachable, reach_detail = await self.check_blob_reachability(sas_url)
         if not reachable:
             logger.error(
-                "[%s] Uploaded video SAS URL is not publicly reachable: %s",
+                "[%s] Uploaded media SAS URL is not publicly reachable: %s",
                 job_id,
                 reach_detail,
             )
             raise RuntimeError(
-                f"Uploaded video blob failed public reachability check: {reach_detail}"
+                f"Uploaded media blob failed public reachability check: {reach_detail}"
             )
 
         logger.info(
-            "[%s] Video successfully uploaded and verified: blob='%s', size=%d, reachability=%s",
+            "[%s] Media successfully uploaded and verified: blob='%s', size=%d, reachability=%s",
             job_id,
             blob_name,
             local_size,
@@ -260,6 +265,25 @@ class AzureStorageManager:
             "expires_at": expiry.isoformat(),
             "size": local_size,
         }
+
+    async def upload_video_blob(
+        self,
+        job_id: str,
+        file_path: str,
+        expiry_hours: int = DEFAULT_VIDEO_SAS_EXPIRY_HOURS,
+        max_retries: int = MAX_UPLOAD_RETRIES,
+        initial_backoff: float = INITIAL_RETRY_BACKOFF_SECONDS,
+    ) -> Dict[str, Any]:
+        """Uploads processed video to Azure Blob Storage."""
+        return await self.upload_media_blob(
+            job_id=job_id,
+            file_path=file_path,
+            blob_name=f"{job_id}.mp4",
+            content_type="video/mp4",
+            expiry_hours=expiry_hours,
+            max_retries=max_retries,
+            initial_backoff=initial_backoff,
+        )
 
     async def ensure_cover_uploaded(
         self,

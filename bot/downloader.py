@@ -30,6 +30,8 @@ class DownloadResult:
     duration: Optional[int]
     file_path: str
     file_size: int
+    is_carousel: bool = False
+    carousel_items: Optional[List[Dict[str, Any]]] = None
 
 
 class DownloadCategory:
@@ -196,45 +198,71 @@ class YouTubeDownloader:
         job_id: str,
         player_client: str,
         progress_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
+        is_instagram: bool = False,
     ) -> Dict[str, Any]:
-        """Constructs yt-dlp options dictionary."""
-        output_template = str(DOWNLOADS_DIR / f"{job_id}.%(ext)s")
+        """Constructs yt-dlp options dictionary for YouTube or Instagram."""
+        if is_instagram:
+            job_dir = DOWNLOADS_DIR / job_id
+            job_dir.mkdir(parents=True, exist_ok=True)
+            output_template = str(job_dir / "%(autonumber)02d_%(id)s.%(ext)s")
+        else:
+            output_template = str(DOWNLOADS_DIR / f"{job_id}.%(ext)s")
+
         cookies_path = self._get_validated_cookies_path()
 
+        if is_instagram:
+            format_str = "bestvideo*+bestaudio/best"
+            format_sort = ["res:1080", "quality", "size", "br", "fps"]
+        else:
+            # For YouTube: Strictly prioritize original audio and English audio tracks over foreign dubs
+            format_str = (
+                "bestvideo*+("
+                "bestaudio[language_preference>=10]/"
+                "bestaudio[format_note*=original]/"
+                "bestaudio[language^=en]/"
+                "bestaudio[language=en]/"
+                "bestaudio"
+                ")/best"
+            )
+            format_sort = ["res:1080", "lang:en", "quality", "size", "br", "fps"]
+
         ydl_opts: Dict[str, Any] = {
-            "format": "bestvideo*+bestaudio/best",
-            "format_sort": ["res:1080", "quality", "size", "br", "fps"],
+            "format": format_str,
+            "format_sort": format_sort,
             "merge_output_format": "mp4",
             "outtmpl": output_template,
             "socket_timeout": 30,
             "quiet": False,
             "no_warnings": False,
             "nocheckcertificate": False,
-            "remote_components": ["ejs:github"],
         }
 
-        # Explicitly configure Deno runtime path for yt-dlp JS challenge solving
-        deno_bin = shutil.which("deno")
-        if not deno_bin:
-            for candidate in [
-                Path.home() / ".deno" / "bin" / "deno",
-                Path("/usr/local/bin/deno"),
-                Path("/usr/bin/deno"),
-            ]:
-                if candidate.is_file():
-                    deno_bin = str(candidate)
-                    break
+        if not is_instagram:
+            ydl_opts["remote_components"] = ["ejs:github"]
 
-        if deno_bin:
-            ydl_opts["js_runtimes"] = {"deno": {"path": deno_bin}}
-            logger.info("[%s] Using Deno JS runtime at: %s", job_id, deno_bin)
+            # Explicitly configure Deno runtime path for yt-dlp JS challenge solving
+            deno_bin = shutil.which("deno")
+            if not deno_bin:
+                for candidate in [
+                    Path.home() / ".deno" / "bin" / "deno",
+                    Path("/usr/local/bin/deno"),
+                    Path("/usr/bin/deno"),
+                ]:
+                    if candidate.is_file():
+                        deno_bin = str(candidate)
+                        break
 
-        if player_client and player_client.lower() != "default":
-            ydl_opts["extractor_args"] = {
-                "youtube": {
-                    "player_client": [player_client],
-                }
+            if deno_bin:
+                ydl_opts["js_runtimes"] = {"deno": {"path": deno_bin}}
+                logger.info("[%s] Using Deno JS runtime at: %s", job_id, deno_bin)
+
+            youtube_args: Dict[str, Any] = {
+                "lang": ["en"],
             }
+            if player_client and player_client.lower() != "default":
+                youtube_args["player_client"] = [player_client]
+
+            ydl_opts["extractor_args"] = {"youtube": youtube_args}
 
         if cookies_path:
             ydl_opts["cookiefile"] = cookies_path
@@ -285,7 +313,102 @@ class YouTubeDownloader:
                 except Exception:
                     pass
 
-        # Iterate over player clients (fallback rotation)
+        # 1. Instagram Download Flow (Reels & Carousels)
+        if "instagram.com" in url.lower():
+            logger.info("[%s] Downloading Instagram media: %s", job_id, url)
+            for attempt in range(1, max_network_retries + 1):
+                try:
+                    opts = self._build_ydl_opts(job_id, "default", ytdlp_hook, is_instagram=True)
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        if not info:
+                            raise DownloadError("Failed to extract Instagram media.")
+
+                        raw_title = info.get("title") or info.get("description") or "Instagram Media"
+                        title = raw_title.replace("\n", " ").strip()
+                        if len(title) > 60:
+                            title = title[:57] + "..."
+                        duration = info.get("duration")
+
+                        job_dir = DOWNLOADS_DIR / job_id
+                        found_files = []
+                        if job_dir.exists():
+                            for f in sorted(job_dir.glob("*")):
+                                if f.is_file() and not f.name.endswith((".part", ".ytdl")):
+                                    found_files.append(f)
+                        if not found_files:
+                            for f in sorted(DOWNLOADS_DIR.glob(f"{job_id}*")):
+                                if f.is_file() and not f.name.endswith((".part", ".ytdl")):
+                                    found_files.append(f)
+
+                        if not found_files:
+                            raise FileNotFoundError(f"No downloaded media found for Instagram job {job_id}")
+
+                        VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
+                        IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+                        # Case A: Single video or image post
+                        if len(found_files) == 1:
+                            single_file = found_files[0]
+                            file_size = single_file.stat().st_size
+                            return DownloadResult(
+                                job_id=job_id,
+                                title=title,
+                                duration=duration,
+                                file_path=str(single_file.resolve()),
+                                file_size=file_size,
+                                is_carousel=False,
+                            )
+
+                        # Case B: Multi-item Carousel post
+                        items = []
+                        total_size = 0
+                        for f in found_files:
+                            ext = f.suffix.lower()
+                            item_type = "video" if ext in VIDEO_EXTS else "image" if ext in IMAGE_EXTS else "video"
+                            sz = f.stat().st_size
+                            total_size += sz
+                            items.append({
+                                "type": item_type,
+                                "file_path": str(f.resolve()),
+                                "file_size": sz,
+                            })
+
+                        logger.info(
+                            "[%s] Instagram carousel download complete: %d items (%d videos, %d images)",
+                            job_id,
+                            len(items),
+                            sum(1 for i in items if i["type"] == "video"),
+                            sum(1 for i in items if i["type"] == "image"),
+                        )
+                        return DownloadResult(
+                            job_id=job_id,
+                            title=title,
+                            duration=duration,
+                            file_path=str(found_files[0].resolve()),
+                            file_size=total_size,
+                            is_carousel=True,
+                            carousel_items=items,
+                        )
+                except Exception as exc:
+                    last_exception = exc
+                    category, user_msg = classify_error(exc)
+                    last_category = category
+                    last_user_message = user_msg
+                    logger.warning(
+                        "[%s] Instagram download attempt %d/%d failed: %s",
+                        job_id,
+                        attempt,
+                        max_network_retries,
+                        exc,
+                    )
+                    if attempt < max_network_retries:
+                        time.sleep(2 ** attempt)
+
+            self._cleanup_partial_files(job_id)
+            raise RuntimeError(f"[{last_category}] {last_user_message}") from last_exception
+
+        # 2. YouTube Download Flow (with player client fallback rotation)
         for client_idx, client in enumerate(player_clients):
             logger.info(
                 "[%s] Attempting download with player_client='%s' (option %d of %d)...",
@@ -375,7 +498,11 @@ class YouTubeDownloader:
         """Cleans up any partial or incomplete files left on disk for this job."""
         if not DOWNLOADS_DIR.exists():
             return
-        for p in DOWNLOADS_DIR.glob(f"{job_id}.*"):
+        job_dir = DOWNLOADS_DIR / job_id
+        if job_dir.is_dir():
+            shutil.rmtree(job_dir, ignore_errors=True)
+            logger.debug("[%s] Cleaned up job download directory: %s", job_id, job_dir.name)
+        for p in DOWNLOADS_DIR.glob(f"{job_id}*"):
             try:
                 if p.is_file():
                     p.unlink(missing_ok=True)

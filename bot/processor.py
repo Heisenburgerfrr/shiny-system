@@ -167,22 +167,36 @@ class VideoProcessor:
         instructions: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable[[int, float, float], None]] = None,
         timeout_seconds: int = 300,
+        input_file: Optional[Path] = None,
+        output_file: Optional[Path] = None,
+        update_job_store: bool = True,
     ) -> ProcessedResult:
         """
         Processes the downloaded video into an Instagram-ready unique video in storage/processed/{job_id}.mp4.
         """
-        input_path = DOWNLOADS_DIR / f"{job_id}.mp4"
-        if not input_path.exists():
-            # Look for any candidate
-            candidates = list(DOWNLOADS_DIR.glob(f"{job_id}.*"))
-            valid = [c for c in candidates if not c.name.endswith((".part", ".ytdl"))]
-            if valid:
-                input_path = valid[0]
-            else:
-                raise FileNotFoundError(f"Source video file not found for job {job_id}")
+        if input_file is not None:
+            input_path = Path(input_file).resolve()
+            if not input_path.exists():
+                raise FileNotFoundError(f"Source video file not found at {input_path}")
+        else:
+            input_path = DOWNLOADS_DIR / f"{job_id}.mp4"
+            if not input_path.exists():
+                # Look for any candidate
+                candidates = list(DOWNLOADS_DIR.glob(f"{job_id}.*"))
+                valid = [c for c in candidates if not c.name.endswith((".part", ".ytdl"))]
+                if valid:
+                    input_path = valid[0]
+                else:
+                    raise FileNotFoundError(f"Source video file not found for job {job_id}")
 
-        output_path = PROCESSED_DIR / f"{job_id}.mp4"
-        job_store.start_processing(job_id, instructions=instructions or {"preset": preset})
+        if output_file is not None:
+            output_path = Path(output_file).resolve()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            output_path = PROCESSED_DIR / f"{job_id}.mp4"
+
+        if update_job_store:
+            job_store.start_processing(job_id, instructions=instructions or {"preset": preset})
 
         # 1. Read source info for progress calculation
         src_info = get_video_info(input_path)
@@ -278,13 +292,15 @@ class VideoProcessor:
                 process.kill()
             except Exception:
                 pass
-            job_store.fail_processing(job_id, f"Processing timed out after {timeout_seconds}s")
+            if update_job_store:
+                job_store.fail_processing(job_id, f"Processing timed out after {timeout_seconds}s")
             raise TimeoutError(f"Video processing timed out after {timeout_seconds} seconds.")
 
         if process.returncode != 0:
             err_msg = stderr_bytes.decode("utf-8", errors="replace").strip()
             logger.error("[%s] FFmpeg processing failed with code %d:\n%s", job_id, process.returncode, err_msg)
-            job_store.fail_processing(job_id, f"FFmpeg failed: {err_msg[:200]}")
+            if update_job_store:
+                job_store.fail_processing(job_id, f"FFmpeg failed: {err_msg[:200]}")
             # Clean up corrupted output if any
             if output_path.exists():
                 output_path.unlink(missing_ok=True)
@@ -292,7 +308,8 @@ class VideoProcessor:
 
         # 5. Output Validation via ffprobe
         if not output_path.exists() or output_path.stat().st_size == 0:
-            job_store.fail_processing(job_id, "Output video file missing or 0 bytes.")
+            if update_job_store:
+                job_store.fail_processing(job_id, "Output video file missing or 0 bytes.")
             raise RuntimeError("Processed video file is empty or missing.")
 
         out_info = get_video_info(output_path)
@@ -307,16 +324,17 @@ class VideoProcessor:
         )
 
         # 6. Mark completed in job store
-        job_store.complete_processing(
-            job_id=job_id,
-            processed_file_path=str(output_path.resolve()),
-            file_size=out_size,
-            duration=out_duration,
-        )
+        if update_job_store:
+            job_store.complete_processing(
+                job_id=job_id,
+                processed_file_path=str(output_path.resolve()),
+                file_size=out_size,
+                duration=out_duration,
+            )
 
-        # 7. Clean up original download to save disk space
+        # 7. Clean up original download to save disk space (only for standalone downloads)
         try:
-            if input_path.exists():
+            if input_file is None and input_path.exists():
                 input_path.unlink(missing_ok=True)
                 logger.info("[%s] Cleaned up temporary raw download: %s", job_id, input_path.name)
         except Exception as e:

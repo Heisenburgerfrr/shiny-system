@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -155,6 +155,74 @@ class InstagramPublisher:
 
         container_id = data["id"]
         logger.info("Instagram Reels container created: container_id=%s", container_id)
+        return container_id
+
+    async def create_carousel_item_container(
+        self,
+        media_url: str,
+        media_type: str = "VIDEO",
+    ) -> str:
+        """
+        Creates a child item container for an Instagram Carousel.
+        POST /{ig-user-id}/media with is_carousel_item=true
+        """
+        endpoint = f"{self.base_url}/{self.business_account_id}/media"
+        payload = {
+            "is_carousel_item": "true",
+            "access_token": self.access_token,
+        }
+        if media_type.upper() == "VIDEO":
+            payload["media_type"] = "VIDEO"
+            payload["video_url"] = media_url
+        else:
+            payload["media_type"] = "IMAGE"
+            payload["image_url"] = media_url
+
+        logger.info("Creating Carousel item container (%s)...", media_type)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(endpoint, data=payload)
+            data = resp.json()
+
+        if resp.status_code != 200 or "id" not in data:
+            err_dict = data.get("error", {})
+            exc = _classify_meta_error(err_dict, resp.status_code)
+            logger.error("Failed to create Carousel item container: %s", exc)
+            raise exc
+
+        container_id = data["id"]
+        logger.info("Carousel item container created: container_id=%s (%s)", container_id, media_type)
+        return container_id
+
+    async def create_carousel_parent_container(
+        self,
+        children_ids: List[str],
+        caption: str,
+    ) -> str:
+        """
+        Creates the parent Carousel container linking child item containers in sequence.
+        POST /{ig-user-id}/media with media_type=CAROUSEL, children=id1,id2,...
+        """
+        endpoint = f"{self.base_url}/{self.business_account_id}/media"
+        payload = {
+            "media_type": "CAROUSEL",
+            "children": ",".join(children_ids),
+            "caption": caption,
+            "access_token": self.access_token,
+        }
+
+        logger.info("Creating parent Carousel container with %d children...", len(children_ids))
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(endpoint, data=payload)
+            data = resp.json()
+
+        if resp.status_code != 200 or "id" not in data:
+            err_dict = data.get("error", {})
+            exc = _classify_meta_error(err_dict, resp.status_code)
+            logger.error("Failed to create parent Carousel container: %s", exc)
+            raise exc
+
+        container_id = data["id"]
+        logger.info("Parent Carousel container created: container_id=%s", container_id)
         return container_id
 
     async def poll_container_status(
@@ -378,6 +446,83 @@ class InstagramPublisher:
 
         return {
             "container_id": container_id,
+            "media_id": media_id,
+            "permalink": permalink,
+            "caption": final_caption,
+        }
+
+    async def publish_carousel(
+        self,
+        job_id: str,
+        items: List[Dict[str, str]],
+        caption: str,
+        progress_callback: Optional[Callable[[str, float], Awaitable[None]]] = None,
+    ) -> Dict[str, str]:
+        """
+        Full end-to-end Carousel publishing pipeline:
+        1. Rate limit safety check
+        2. Create child container for each slide (video or image)
+        3. Poll status for each child container
+        4. Create parent CAROUSEL container
+        5. Publish parent container
+        6. Fetch live permalink
+        """
+        allowed, count = self.check_rate_limit()
+        if not allowed:
+            raise InstagramRateLimitError(
+                f"Instagram 24-hour publishing limit reached ({count} posts). "
+                "Please wait before posting more content."
+            )
+
+        final_caption = caption.strip()
+        if INSTAGRAM_CAPTION_SUFFIX and INSTAGRAM_CAPTION_SUFFIX not in final_caption:
+            final_caption = f"{final_caption}\n{INSTAGRAM_CAPTION_SUFFIX}".strip()
+
+        child_container_ids: List[str] = []
+        total_items = len(items)
+
+        # 1. Create child containers
+        for idx, item in enumerate(items):
+            m_type = item.get("type", "video").upper()
+            m_url = item["url"]
+            if progress_callback:
+                pct = ((idx) / total_items) * 40.0
+                await progress_callback(f"Creating slide {idx + 1}/{total_items}...", pct)
+
+            c_id = await self.create_carousel_item_container(media_url=m_url, media_type=m_type)
+            child_container_ids.append(c_id)
+
+        # 2. Poll child containers until ready
+        for idx, c_id in enumerate(child_container_ids):
+            if progress_callback:
+                pct = 40.0 + ((idx + 1) / total_items) * 40.0
+                await progress_callback(f"Processing slide {idx + 1}/{total_items}...", pct)
+            await self.poll_container_status(c_id)
+
+        # 3. Create parent carousel container
+        if progress_callback:
+            await progress_callback("Finalizing carousel...", 85.0)
+
+        parent_container_id = await self.create_carousel_parent_container(
+            children_ids=child_container_ids,
+            caption=final_caption,
+        )
+        job_store.record_container_created(job_id, parent_container_id)
+
+        # 4. Publish parent container
+        if progress_callback:
+            await progress_callback("Publishing carousel...", 95.0)
+
+        media_id = await self.publish_container(parent_container_id)
+
+        # 5. Fetch live permalink
+        permalink = await self.get_media_permalink(media_id)
+
+        # 6. Update SQLite record
+        job_store.complete_publishing(job_id=job_id, media_id=media_id, permalink=permalink)
+
+        return {
+            "container_id": parent_container_id,
             "media_id": media_id,
             "permalink": permalink,
             "caption": final_caption,

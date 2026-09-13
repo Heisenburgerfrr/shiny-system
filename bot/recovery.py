@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import shutil
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -75,6 +76,10 @@ class StorageCleaner:
                         file_path.unlink(missing_ok=True)
                         deleted.append(file_path)
                         logger.debug("[%s] Deleted local artifact: %s", job_id, file_path.name)
+                    elif file_path.is_dir():
+                        shutil.rmtree(file_path, ignore_errors=True)
+                        deleted.append(file_path)
+                        logger.debug("[%s] Deleted local directory artifact: %s", job_id, file_path.name)
                 except Exception as exc:
                     logger.warning("[%s] Failed to delete artifact %s: %s", job_id, file_path.name, exc)
 

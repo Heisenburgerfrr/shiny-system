@@ -6,9 +6,10 @@ import functools
 import logging
 from pathlib import Path
 import re
+import shutil
 import time
 import uuid
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import httpx
 from azure.storage.blob import BlobServiceClient
@@ -26,19 +27,32 @@ from bot.instagram_publish import (
     InstagramTokenExpiredError,
     instagram_publisher,
 )
-from bot.processor import ProcessedResult, video_processor
+from bot.processor import PROCESSED_DIR, ProcessedResult, video_processor
 from bot.recovery import (
     failure_tracker,
     startup_recovery,
     storage_cleaner,
     task_registry,
 )
+from bot.render_queue import render_queue
 
 logger = logging.getLogger("bot.handlers")
 
 # Regex to detect YouTube URLs (videos, shorts, youtu.be, live streams)
 YOUTUBE_URL_REGEX = re.compile(
     r"(https?://(?:www\.)?(?:youtube\.com/(?:watch\?[^\s]*v=|shorts/|live/|embed/)|youtu\.be/)[a-zA-Z0-9_\-]+[^\s]*)",
+    re.IGNORECASE,
+)
+
+# Regex to detect Instagram URLs (reels, p/posts, share links)
+INSTAGRAM_URL_REGEX = re.compile(
+    r"(https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:reel|reels|p|share)/[a-zA-Z0-9_\-]+[^\s]*)",
+    re.IGNORECASE,
+)
+
+# Unified Media URL Regex matching either YouTube or Instagram
+MEDIA_URL_REGEX = re.compile(
+    r"(https?://(?:www\.)?(?:youtube\.com/(?:watch\?[^\s]*v=|shorts/|live/|embed/)|youtu\.be/|(?:instagram\.com|instagr\.am)/(?:reel|reels|p|share)/)[a-zA-Z0-9_\-]+[^\s]*)",
     re.IGNORECASE,
 )
 
@@ -128,11 +142,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.info("Received /start command from user_id=%s (@%s)", user.id, user.username)
 
     welcome_message = (
-        "👋 **Welcome to Reels Publisher!**\n\n"
-        "Send any **YouTube Shorts or video link** to automatically process and publish directly to your **Instagram Reels**.\n\n"
+        "👋 **Welcome to Media Publisher!**\n\n"
+        "Send any **YouTube link** (Shorts/Videos) or **Instagram link** (Reels or Carousel sliding posts) to automatically optimize and publish to Instagram!\n\n"
+        "🎬 **Supported Formats:**\n"
+        "• **YouTube Shorts / Videos** ➔ Instagram Reels\n"
+        "• **Instagram Reels** (`/reel/`) ➔ Instagram Reels\n"
+        "• **Instagram Carousels** (`/p/`) ➔ 1–10 slides (videos, images, or mixed) as Instagram Carousel posts\n\n"
+        "⚙️ **Smart Render Queue:**\n"
+        "• Heavy FFmpeg video rendering is safely queued (1 at a time) to prevent VM CPU/memory overload while downloads run concurrently.\n\n"
         "💡 **How it works:**\n"
-        "• Send **only a link** and the bot will automatically use your default caption template.\n"
-        "• Or send a link with a **custom caption** below it to use that caption instead.\n\n"
+        "• Send **only a link** and the bot uses your default caption template.\n"
+        "• Or send a link with a **custom caption** in the same message to use that caption.\n\n"
         "⚡ **Commands:**\n"
         "• `/caption` — View or edit default caption template\n"
         "• `/cover` — View or update Reels cover image\n"
@@ -585,8 +605,27 @@ async def _run_download_background(
         size_str = _format_bytes(result.file_size)
         logger.info("[%s] Download succeeded: '%s' (%s). Starting processing...", job_id, result.title, size_str)
 
+        # Branch for multi-slide carousel posts
+        if result.is_carousel and result.carousel_items and len(result.carousel_items) > 1:
+            await _handle_carousel_pipeline(
+                job_id=job_id,
+                result=result,
+                status_msg=status_msg,
+                loop=loop,
+            )
+            return
+
+        # Single video flow (YouTube Shorts, YouTube Video, or single Instagram Reel)
+        async def on_queue_wait(position: int) -> None:
+            wait_text = (
+                f"⏳ **Waiting in Render Queue...**\n\n"
+                f"🎬 **{result.title}**\n\n"
+                f"Position: `#{position}` in queue (Rendering 1 at a time to prevent server overload)"
+            )
+            await _update_progress_message(status_msg, wait_text)
+
         proc_start_msg = (
-            f"⚡ **Processing Reel...**\n\n"
+            f"⚡ **Processing Video...**\n\n"
             f"🎬 **{result.title}**\n\n"
             f"⚙️ Optimizing video format..."
         )
@@ -603,7 +642,7 @@ async def _run_download_background(
                 filled = int(bar_len * pct / 100)
                 bar = "█" * filled + "░" * (bar_len - filled)
                 p_text = (
-                    f"⚡ **Processing Reel...**\n\n"
+                    f"⚡ **Processing Video...**\n\n"
                     f"🎬 **{result.title}**\n\n"
                     f"✂️ **Rendering**: `[{bar}] {pct}%`"
                 )
@@ -612,11 +651,12 @@ async def _run_download_background(
                     loop,
                 )
 
-        proc_result = await video_processor.process_video(
-            job_id=job_id,
-            preset="balanced",
-            progress_callback=proc_progress_callback,
-        )
+        async with render_queue.acquire_slot(job_id, on_wait_callback=on_queue_wait):
+            proc_result = await video_processor.process_video(
+                job_id=job_id,
+                preset="balanced",
+                progress_callback=proc_progress_callback,
+            )
 
         failure_tracker.record_success("processing")
         final_duration_str = _format_seconds(proc_result.duration)
@@ -857,6 +897,244 @@ async def _run_instagram_publish_background(
         task_registry.unregister_task(job_id)
 
 
+async def _handle_carousel_pipeline(
+    job_id: str,
+    result: DownloadResult,
+    status_msg: Message,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Handles multi-slide Instagram carousel posts (videos, images, or mixed)."""
+    items = result.carousel_items or []
+    total = len(items)
+    logger.info("[%s] Beginning carousel pipeline with %d slides...", job_id, total)
+
+    try:
+        await _update_progress_message(
+            status_msg,
+            f"⚡ **Processing Carousel Post...**\n\n"
+            f"📸 **{result.title}**\n\n"
+            f"Found {total} slides. Preparing media for Instagram...",
+        )
+
+        uploaded_items: List[Dict[str, str]] = []
+
+        for idx, item in enumerate(items, start=1):
+            item_type = item.get("type", "video")
+            source_path = Path(item["file_path"])
+
+            if item_type == "video":
+                # Video slide: serialize through render_queue
+                async def on_queue_wait(position: int) -> None:
+                    wait_text = (
+                        f"⏳ **Waiting in Render Queue...**\n\n"
+                        f"📸 Slide {idx}/{total} (Video)\n\n"
+                        f"Position: `#{position}` in queue"
+                    )
+                    await _update_progress_message(status_msg, wait_text)
+
+                await _update_progress_message(
+                    status_msg,
+                    f"⚡ **Processing Carousel ({idx}/{total})...**\n\n"
+                    f"🎬 Optimizing video slide {idx}...",
+                )
+
+                processed_slide_path = PROCESSED_DIR / f"{job_id}_slide_{idx}.mp4"
+                async with render_queue.acquire_slot(f"{job_id}_slide_{idx}", on_wait_callback=on_queue_wait):
+                    await video_processor.process_video(
+                        job_id=job_id,
+                        preset="balanced",
+                        input_file=source_path,
+                        output_file=processed_slide_path,
+                        update_job_store=False,
+                    )
+
+                # Upload video slide to Azure Blob Storage
+                await _update_progress_message(
+                    status_msg,
+                    f"☁️ **Uploading Carousel ({idx}/{total})...**\n\n"
+                    f"Uploading video slide {idx} to cloud storage...",
+                )
+                upload_data = await azure_storage_manager.upload_media_blob(
+                    job_id=job_id,
+                    file_path=str(processed_slide_path),
+                    blob_name=f"{job_id}_slide_{idx}.mp4",
+                    content_type="video/mp4",
+                )
+                uploaded_items.append({
+                    "url": upload_data["sas_url"],
+                    "type": "VIDEO",
+                })
+
+            else:
+                # Image slide: optimize via Pillow as JPEG RGB
+                await _update_progress_message(
+                    status_msg,
+                    f"⚡ **Processing Carousel ({idx}/{total})...**\n\n"
+                    f"🖼️ Optimizing image slide {idx}...",
+                )
+                processed_img_path = PROCESSED_DIR / f"{job_id}_slide_{idx}.jpg"
+                try:
+                    from PIL import Image
+                    with Image.open(source_path) as img:
+                        rgb_img = img.convert("RGB")
+                        rgb_img.save(processed_img_path, format="JPEG", quality=95, optimize=True)
+                except Exception as img_err:
+                    logger.warning("[%s] Pillow processing failed for slide %d: %s. Copying original...", job_id, idx, img_err)
+                    shutil.copy2(source_path, processed_img_path)
+
+                await _update_progress_message(
+                    status_msg,
+                    f"☁️ **Uploading Carousel ({idx}/{total})...**\n\n"
+                    f"Uploading image slide {idx} to cloud storage...",
+                )
+                upload_data = await azure_storage_manager.upload_media_blob(
+                    job_id=job_id,
+                    file_path=str(processed_img_path),
+                    blob_name=f"{job_id}_slide_{idx}.jpg",
+                    content_type="image/jpeg",
+                )
+                uploaded_items.append({
+                    "url": upload_data["sas_url"],
+                    "type": "IMAGE",
+                })
+
+        # All slides processed and uploaded to Azure!
+        job = job_store.get_job(job_id)
+        caption = (job.get("caption") if job else None) or job_store.get_setting("default_caption") or DEFAULT_MEME_CAPTION
+
+        await _update_progress_message(
+            status_msg,
+            f"⚡ **Publishing Carousel...**\n\n"
+            f"📸 **{result.title}** ({total} slides)\n\n"
+            f"🚀 Publishing to Instagram...",
+        )
+        asyncio.create_task(
+            _run_instagram_carousel_publish_background(
+                job_id=job_id,
+                items=uploaded_items,
+                caption=caption,
+                status_msg=status_msg,
+                title=result.title,
+            )
+        )
+
+    except asyncio.CancelledError:
+        logger.info("[%s] Carousel pipeline was cancelled.", job_id)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        raise
+    except Exception as exc:
+        err_msg = str(exc)
+        job_store.fail_processing(job_id, err_msg)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        logger.error("[%s] Carousel processing pipeline failed: %s", job_id, err_msg, exc_info=True)
+        await _update_progress_message(
+            status_msg,
+            f"❌ **Carousel Processing Failed**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Reason**: {err_msg[:200]}\n\n"
+            f"Review logs or use `/retry {job_id}`.",
+        )
+
+
+async def _run_instagram_carousel_publish_background(
+    job_id: str,
+    items: List[Dict[str, str]],
+    caption: str,
+    status_msg: Message,
+    title: str = "Instagram Carousel",
+) -> None:
+    """Executes the multi-slide Instagram carousel publishing pipeline."""
+    current_task = asyncio.current_task()
+    if current_task:
+        task_registry.register_task(job_id, current_task)
+
+    job_store.start_publishing(job_id, caption=caption)
+    last_update_time = 0.0
+
+    async def publish_progress(status_code: str, elapsed: float) -> None:
+        nonlocal last_update_time
+        now = time.monotonic()
+        if now - last_update_time >= 3.0:
+            last_update_time = now
+            msg_text = (
+                f"⚡ **Publishing Carousel...**\n\n"
+                f"📸 **{title}** ({len(items)} slides)\n\n"
+                f"🚀 Rendering on Instagram ({int(elapsed)}s)..."
+            )
+            await _update_progress_message(status_msg, msg_text)
+
+    try:
+        publish_res = await instagram_publisher.publish_carousel(
+            job_id=job_id,
+            items=items,
+            caption=caption,
+            progress_callback=publish_progress,
+        )
+
+        storage_cleaner.cleanup_job_local_files(job_id)
+        failure_tracker.record_success("instagram_publish")
+
+        permalink = publish_res.get("permalink", "https://instagram.com")
+        success_msg = (
+            f"🎉 **Carousel Published!**\n\n"
+            f"📸 **{title}** ({len(items)} slides)\n\n"
+            f"👉 [Watch on Instagram]({permalink})"
+        )
+        await _update_progress_message(status_msg, success_msg)
+        logger.info("[%s] Instagram Carousel successfully published: %s", job_id, permalink)
+
+    except asyncio.CancelledError:
+        logger.info("[%s] Instagram carousel publish task was cancelled.", job_id)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        raise
+
+    except InstagramTokenExpiredError as token_err:
+        job_store.fail_publishing(job_id, str(token_err))
+        storage_cleaner.cleanup_job_local_files(job_id)
+        sys_alert = failure_tracker.record_failure("token", job_id, str(token_err))
+        alert_msg = (
+            f"🚨 **CRITICAL: Instagram Access Token Expired!**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Error**: Meta rejected the access token as expired or invalid.\n\n"
+            f"⚠️ **Action Required**: Please generate a new 60-day long-lived access token."
+        )
+        if sys_alert:
+            alert_msg += f"\n\n{sys_alert}"
+        await _update_progress_message(status_msg, alert_msg)
+
+    except InstagramRateLimitError as rate_err:
+        job_store.fail_publishing(job_id, str(rate_err))
+        storage_cleaner.cleanup_job_local_files(job_id)
+        sys_alert = failure_tracker.record_failure("instagram_publish", job_id, str(rate_err))
+        rate_msg = (
+            f"⏳ **Instagram Rate Limit Reached**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Reason**: {rate_err}\n\n"
+            f"Please wait before publishing more posts."
+        )
+        if sys_alert:
+            rate_msg += f"\n\n{sys_alert}"
+        await _update_progress_message(status_msg, rate_msg)
+
+    except Exception as exc:
+        err_msg = str(exc)
+        job_store.fail_publishing(job_id, err_msg)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        sys_alert = failure_tracker.record_failure("instagram_publish", job_id, err_msg)
+        logger.error("[%s] Instagram carousel publishing failed: %s", job_id, err_msg, exc_info=True)
+        fail_msg = (
+            f"❌ **Instagram Carousel Publish Failed**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Reason**: {err_msg}\n\n"
+            f"Review logs or use `/retry {job_id}`."
+        )
+        if sys_alert:
+            fail_msg += f"\n\n{sys_alert}"
+        await _update_progress_message(status_msg, fail_msg)
+    finally:
+        task_registry.unregister_task(job_id)
+
+
 @restricted
 async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -923,19 +1201,19 @@ async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.info("Successfully updated cookies.txt via pasted text (size: %.1f KB, authenticated=%s)", size_kb, has_auth)
         return
 
-    match = YOUTUBE_URL_REGEX.search(message.text)
+    match = MEDIA_URL_REGEX.search(message.text)
     if not match:
         # Check if the user is replying with a caption for an active job
         awaiting_job = job_store.get_active_awaiting_caption_job(user_id)
         if awaiting_job:
             caption_text = message.text.strip()
-            # If user sent /skip, default to the original YouTube video title
+            # If user sent /skip, default to the original video title
             if caption_text.lower() == "/skip":
-                caption_text = awaiting_job.get("title") or "New Reel"
+                caption_text = awaiting_job.get("title") or "New Post"
 
             job_id = awaiting_job["job_id"]
             status_msg = await message.reply_text(
-                "🚀 **Publishing Reel...**\n\n"
+                "🚀 **Publishing...**\n\n"
                 "Sending to Instagram...",
                 parse_mode="Markdown",
             )
@@ -944,6 +1222,9 @@ async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     url = match.group(1).strip()
+    is_ig = "instagram.com" in url.lower() or "instagr.am" in url.lower()
+    platform_name = "Instagram" if is_ig else "YouTube"
+    post_type_label = "Post" if is_ig else "Reel"
 
     # Extract inline caption (everything other than the URL)
     # Allows sending: https://youtube.com/watch?v=xyz My multiline caption here
@@ -959,10 +1240,11 @@ async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 1. Generate unique Job ID (UUID4)
     job_id = str(uuid.uuid4())
     logger.info(
-        "New download job registered: job_id=%s, user_id=%s, url=%s, has_inline_caption=%s",
+        "New download job registered: job_id=%s, user_id=%s, url=%s, platform=%s, has_inline_caption=%s",
         job_id,
         user_id,
         url,
+        platform_name,
         bool(inline_caption),
     )
 
@@ -972,14 +1254,18 @@ async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 3. Send immediate acknowledgment message
     caption_note = " (with custom caption)" if inline_caption else ""
     ack_text = (
-        f"⚡ **Processing Reel{caption_note}...**\n\n"
-        f"📥 Connecting to YouTube..."
+        f"⚡ **Processing {platform_name} {post_type_label}{caption_note}...**\n\n"
+        f"📥 Connecting to {platform_name}..."
     )
     status_msg = await message.reply_text(ack_text, parse_mode="Markdown")
 
     # 4. Start background download task without blocking the polling event loop
     loop = asyncio.get_running_loop()
     asyncio.create_task(_run_download_background(job_id, url, status_msg, loop))
+
+
+# Alias for clarity
+media_url_handler = youtube_url_handler
 
 
 async def _resume_azure_upload(
