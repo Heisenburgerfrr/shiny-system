@@ -50,6 +50,18 @@ def classify_error(exc: Exception) -> Tuple[str, str]:
     """
     err_str = str(exc).lower()
 
+    # Instagram API block / rate-limit / empty media response
+    if any(k in err_str for k in [
+        "instagram sent an empty media response",
+        "instagram api is not granting access",
+        "empty media response",
+    ]):
+        return (
+            DownloadCategory.BOT_DETECTED,
+            "Instagram blocked access to this reel from the server IP (rate-limited or login required). "
+            "Wait a few minutes or add Instagram cookies to cookies.txt.",
+        )
+
     # Bot detection / Sign-in required
     if any(k in err_str for k in [
         "sign in to confirm",
@@ -231,7 +243,9 @@ class YouTubeDownloader:
             "format_sort": format_sort,
             "merge_output_format": "mp4",
             "outtmpl": output_template,
-            "socket_timeout": 30,
+            "socket_timeout": 20,
+            "retries": 2,
+            "extractor_retries": 1,
             "quiet": False,
             "no_warnings": False,
             "nocheckcertificate": False,
@@ -411,8 +425,11 @@ class YouTubeDownloader:
                         max_network_retries,
                         exc,
                     )
+                    if is_permanent_failure(category) or category == DownloadCategory.BOT_DETECTED:
+                        self._cleanup_partial_files(job_id)
+                        raise RuntimeError(f"[{category}] {user_msg}") from exc
                     if attempt < max_network_retries:
-                        time.sleep(2 ** attempt)
+                        time.sleep(1)
 
             self._cleanup_partial_files(job_id)
             raise RuntimeError(f"[{last_category}] {last_user_message}") from last_exception

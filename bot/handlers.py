@@ -258,12 +258,104 @@ async def cover_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+def _merge_cookies(existing_content: str, new_content: str) -> str:
+    """Merges new cookies into existing cookies preserving other domains."""
+    if not existing_content.strip():
+        return new_content
+    new_domains = set()
+    for line in new_content.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            parts = line.split("\t")
+            if parts:
+                new_domains.add(parts[0].lstrip("."))
+
+    merged_lines = []
+    for line in existing_content.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.strip().split("\t")
+        if parts:
+            domain = parts[0].lstrip(".")
+            if not any(nd in domain or domain in nd for nd in new_domains):
+                merged_lines.append(line.strip())
+
+    return "# Netscape HTTP Cookie File\n" + "\n".join(merged_lines) + "\n" + new_content.strip() + "\n"
+
+
+def _remove_cookie_domains(content: str, domains_to_remove: Tuple[str, ...]) -> str:
+    """Removes cookies matching specified domain keywords while keeping other cookies intact."""
+    kept_lines = []
+    for line in content.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.strip().split("\t")
+        if parts:
+            domain = parts[0].lower()
+            if any(d in domain for d in domains_to_remove):
+                continue
+            kept_lines.append(line.strip())
+    if kept_lines:
+        return "# Netscape HTTP Cookie File\n" + "\n".join(kept_lines) + "\n"
+    return ""
+
+
+def _format_cookies_badge(content: str) -> Tuple[str, str]:
+    has_yt = any(token in content for token in ["LOGIN_INFO", "__Secure-3PSID", "SAPISID", "SID"])
+    has_ig = any(token in content for token in ["sessionid", "ds_user_id", "csrftoken"])
+    yt_badge = "✅ Authenticated" if has_yt else "⚠️ Missing / Guest"
+    ig_badge = "✅ Authenticated" if has_ig else "⚠️ Missing / Guest"
+    return yt_badge, ig_badge
+
+
+def _build_cookies_dashboard() -> Tuple[str, InlineKeyboardMarkup]:
+    cookies_path = BASE_DIR / "cookies.txt"
+    has_file = cookies_path.is_file()
+    size_kb = (cookies_path.stat().st_size / 1024.0) if has_file else 0.0
+    content = cookies_path.read_text(encoding="utf-8", errors="ignore") if has_file else ""
+    yt_badge, ig_badge = _format_cookies_badge(content)
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔴 Update YouTube", callback_data="cookies_pick_yt"),
+            InlineKeyboardButton("📸 Update Instagram", callback_data="cookies_pick_ig"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Replace Both", callback_data="cookies_pick_all"),
+            InlineKeyboardButton("🔄 Refresh Status", callback_data="cookies_refresh"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Clear YouTube", callback_data="cookies_clear_yt"),
+            InlineKeyboardButton("🗑 Clear Instagram", callback_data="cookies_clear_ig"),
+        ],
+    ])
+
+    if has_file and size_kb > 0:
+        msg = (
+            f"🍪 **Cookies Control Panel**\n\n"
+            f"• **Location**: `{cookies_path.name}` ({size_kb:.1f} KB)\n"
+            f"• **YouTube Session**: {yt_badge}\n"
+            f"• **Instagram Session**: {ig_badge}\n\n"
+            f"👉 **Choose which one to update or manage:**\n"
+            f"Updating YouTube or Instagram individually will **never** affect the other platform!\n\n"
+            f"💡 *You can also drag-and-drop a `cookies.txt` file or paste text directly anytime.*"
+        )
+    else:
+        msg = (
+            f"🍪 **Cookies Control Panel**\n\n"
+            f"⚠️ `cookies.txt` is not currently present on the server.\n\n"
+            f"• **YouTube Session**: {yt_badge}\n"
+            f"• **Instagram Session**: {ig_badge}\n\n"
+            f"👉 Select which platform's cookies you want to add below, or upload a `cookies.txt` file directly."
+        )
+    return msg, keyboard
+
+
 @restricted
 async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handles /cookies: displays current cookies.txt status (file size, presence of login tokens)
+    Handles /cookies: displays interactive control panel for YouTube and Instagram cookies,
     or immediately updates cookies if text was passed (/cookies <pasted lines>).
-    Provides action buttons to either upload a .txt file or paste raw text.
     """
     message = update.effective_message
     if not message:
@@ -275,58 +367,30 @@ async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if len(cmd_parts) > 1 and cmd_parts[1].strip():
             raw_text = cmd_parts[1].strip()
             target_path = BASE_DIR / "cookies.txt"
-            target_path.write_text(raw_text, encoding="utf-8")
-            has_auth = any(token in raw_text for token in ["LOGIN_INFO", "__Secure-3PSID", "SAPISID", "SID"])
-            size_kb = len(raw_text.encode("utf-8")) / 1024.0
-            auth_badge = "✅ Authenticated (Active login session)" if has_auth else "⚠️ Warning: No login tokens detected (Guest session)"
+            existing_text = target_path.read_text(encoding="utf-8", errors="ignore") if target_path.is_file() else ""
+            merged_text = _merge_cookies(existing_text, raw_text)
+            target_path.write_text(merged_text, encoding="utf-8")
+
+            yt_badge, ig_badge = _format_cookies_badge(merged_text)
+            size_kb = len(merged_text.encode("utf-8")) / 1024.0
             await message.reply_text(
-                f"🍪 **YouTube Cookies Updated Successfully!**\n\n"
-                f"• **Method**: Direct argument saved to `{target_path.name}`\n"
+                f"🍪 **Cookies Updated Successfully!**\n\n"
+                f"• **Method**: Direct argument merged into `{target_path.name}`\n"
                 f"• **File Size**: `{size_kb:.1f} KB`\n"
-                f"• **Session**: {auth_badge}\n\n"
-                f"✨ All future YouTube downloads will use these cookies immediately.",
+                f"• **YouTube**: {yt_badge}\n"
+                f"• **Instagram**: {ig_badge}\n\n"
+                f"✨ All future downloads (YouTube & Instagram) will use these cookies immediately.",
                 parse_mode="Markdown",
             )
             return
 
-    cookies_path = BASE_DIR / "cookies.txt"
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📤 Upload .txt File", callback_data="change_cookies_file"),
-            InlineKeyboardButton("📋 Paste Cookie Text", callback_data="change_cookies_paste"),
-        ]
-    ])
-
-    if cookies_path.is_file():
-        size_kb = cookies_path.stat().st_size / 1024.0
-        has_auth = False
-        try:
-            content = cookies_path.read_text(encoding="utf-8", errors="ignore")
-            has_auth = any(token in content for token in ["LOGIN_INFO", "__Secure-3PSID", "SAPISID", "SID"])
-        except Exception:
-            pass
-
-        auth_status = "✅ Authenticated (Active login session)" if has_auth else "⚠️ Guest / Logged-out session"
-        msg = (
-            f"🍪 **Current YouTube Cookies Status**\n\n"
-            f"• **Location**: `{cookies_path.name}`\n"
-            f"• **File Size**: `{size_kb:.1f} KB`\n"
-            f"• **Auth Status**: {auth_status}\n\n"
-            f"💡 *Choose an option below, or simply drop `cookies.txt` or paste your cookie text directly into this chat.*"
-        )
-    else:
-        msg = (
-            f"🍪 **YouTube Cookies Status**\n\n"
-            f"⚠️ `cookies.txt` is not currently present on the server.\n\n"
-            f"Send your exported `cookies.txt` file or paste the cookie text directly into this chat."
-        )
-
+    msg, keyboard = _build_cookies_dashboard()
     await message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown")
 
 
 @restricted
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles inline button clicks for changing caption or cover image."""
+    """Handles inline button clicks for captions, covers, and selective cookie management."""
     query = update.callback_query
     if not query:
         return
@@ -344,6 +408,65 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text(
             "📸 **Send your new cover image now.**\n\n"
             "Send any photo or image. It will be automatically center-cropped to 9:16 and resized to 1080x1920 for Instagram Reels.",
+            parse_mode="Markdown",
+        )
+    elif query.data == "cookies_refresh":
+        msg, keyboard = _build_cookies_dashboard()
+        try:
+            await query.message.edit_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+        except Exception:
+            pass
+    elif query.data == "cookies_clear_yt":
+        target_path = BASE_DIR / "cookies.txt"
+        if target_path.is_file():
+            content = target_path.read_text(encoding="utf-8", errors="ignore")
+            updated = _remove_cookie_domains(content, ("youtube.com", "google.com", "googlevideo.com"))
+            if updated.strip():
+                target_path.write_text(updated, encoding="utf-8")
+            else:
+                target_path.unlink(missing_ok=True)
+        await query.answer("YouTube cookies cleared!", show_alert=False)
+        msg, keyboard = _build_cookies_dashboard()
+        try:
+            await query.message.edit_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+        except Exception:
+            pass
+    elif query.data == "cookies_clear_ig":
+        target_path = BASE_DIR / "cookies.txt"
+        if target_path.is_file():
+            content = target_path.read_text(encoding="utf-8", errors="ignore")
+            updated = _remove_cookie_domains(content, ("instagram.com", "cdninstagram.com"))
+            if updated.strip():
+                target_path.write_text(updated, encoding="utf-8")
+            else:
+                target_path.unlink(missing_ok=True)
+        await query.answer("Instagram cookies cleared!", show_alert=False)
+        msg, keyboard = _build_cookies_dashboard()
+        try:
+            await query.message.edit_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+        except Exception:
+            pass
+    elif query.data == "cookies_pick_yt":
+        context.user_data["awaiting"] = "cookies_yt"
+        await query.message.reply_text(
+            "🔴 **Update YouTube Cookies**\n\n"
+            "Upload your `cookies.txt` file or paste cookie text for YouTube.\n\n"
+            "🔒 **Your Instagram cookies are safe** — they will be kept untouched.",
+            parse_mode="Markdown",
+        )
+    elif query.data == "cookies_pick_ig":
+        context.user_data["awaiting"] = "cookies_ig"
+        await query.message.reply_text(
+            "📸 **Update Instagram Cookies**\n\n"
+            "Upload your `cookies.txt` file or paste cookie text for Instagram.\n\n"
+            "🔒 **Your YouTube cookies are safe** — they will be kept untouched.",
+            parse_mode="Markdown",
+        )
+    elif query.data == "cookies_pick_all":
+        context.user_data["awaiting"] = "cookies_all"
+        await query.message.reply_text(
+            "🔄 **Replace All Cookies**\n\n"
+            "Upload a new `cookies.txt` file or paste text to completely overwrite all existing cookies.",
             parse_mode="Markdown",
         )
     elif query.data in ("change_cookies", "change_cookies_file"):
@@ -436,9 +559,10 @@ async def document_upload_handler(update: Update, context: ContextTypes.DEFAULT_
     filename = (doc.file_name or "").lower()
 
     user_data = getattr(context, "user_data", None)
-    awaiting_cookies = isinstance(user_data, dict) and user_data.get("awaiting") == "cookies"
+    awaiting = user_data.get("awaiting") if isinstance(user_data, dict) else None
+    awaiting_cookies = awaiting in ("cookies", "cookies_yt", "cookies_ig", "cookies_all")
 
-    # Process if named cookies.txt, ends with .txt, or user clicked [Upload New cookies.txt]
+    # Process if named cookies.txt, ends with .txt, or user selected a cookie option
     if not (filename == "cookies.txt" or filename.endswith(".txt") or awaiting_cookies):
         return
 
@@ -455,36 +579,49 @@ async def document_upload_handler(update: Update, context: ContextTypes.DEFAULT_
 
         # Validation: check for Netscape cookie signatures or domain names
         is_netscape = ("# Netscape" in content or "# HTTP Cookie File" in content)
-        is_youtube = ("youtube.com" in content or "google.com" in content)
+        is_media = any(d in content for d in ["youtube.com", "google.com", "instagram.com"])
 
-        if not (is_netscape or is_youtube or "\t" in content):
+        if not (is_netscape or is_media or "\t" in content):
             await status_msg.edit_text(
                 "❌ **Invalid Cookies File**\n\n"
-                "The file does not appear to be a Netscape-format `cookies.txt` exported from YouTube.\n"
-                "Please export your cookies using the *Get cookies.txt LOCALLY* extension while on youtube.com."
+                "The file does not appear to be a Netscape-format `cookies.txt`.\n"
+                "Please export your cookies using the *Get cookies.txt LOCALLY* extension while on youtube.com or instagram.com."
             )
             return
 
         target_path = BASE_DIR / "cookies.txt"
-        shutil.copy2(tmp_path, target_path)
+        existing_text = target_path.read_text(encoding="utf-8", errors="ignore") if target_path.is_file() else ""
+        if awaiting == "cookies_all":
+            merged_text = content
+            action_desc = "Full Replacement (All Cookies Overwritten)"
+        else:
+            merged_text = _merge_cookies(existing_text, content)
+            if awaiting == "cookies_yt":
+                action_desc = "YouTube Updated (Instagram Preserved)"
+            elif awaiting == "cookies_ig":
+                action_desc = "Instagram Updated (YouTube Preserved)"
+            else:
+                action_desc = "Smart Merged (Both Preserved)"
 
-        # Check for authentication tokens
-        has_auth = any(token in content for token in ["LOGIN_INFO", "__Secure-3PSID", "SAPISID", "SID"])
+        target_path.write_text(merged_text, encoding="utf-8")
+
+        yt_badge, ig_badge = _format_cookies_badge(merged_text)
         size_kb = target_path.stat().st_size / 1024.0
 
         if isinstance(user_data, dict):
             user_data["awaiting"] = None
 
-        auth_badge = "✅ Authenticated (Active login session)" if has_auth else "⚠️ Warning: No login tokens detected (Guest session)"
         success_msg = (
-            f"🍪 **YouTube Cookies Updated Successfully!**\n\n"
-            f"• **Destination**: `{target_path.resolve()}`\n"
+            f"🍪 **Cookies Updated Successfully!**\n\n"
+            f"• **Action**: {action_desc}\n"
+            f"• **Destination**: `{target_path.name}`\n"
             f"• **File Size**: `{size_kb:.1f} KB`\n"
-            f"• **Session**: {auth_badge}\n\n"
-            f"✨ All future YouTube downloads will use these cookies immediately."
+            f"• **YouTube Session**: {yt_badge}\n"
+            f"• **Instagram Session**: {ig_badge}\n\n"
+            f"✨ All future downloads (YouTube & Instagram) will use these cookies immediately."
         )
         await status_msg.edit_text(success_msg, parse_mode="Markdown")
-        logger.info("Successfully updated cookies.txt via Telegram (size: %.1f KB, authenticated=%s)", size_kb, has_auth)
+        logger.info("Successfully updated cookies.txt via Telegram (size: %.1f KB, action=%s, YT=%s, IG=%s)", size_kb, action_desc, yt_badge, ig_badge)
 
     except Exception as exc:
         logger.error("Failed to process uploaded cookies.txt: %s", exc, exc_info=True)
@@ -1166,40 +1303,56 @@ async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 2. Check if user is sending pasted cookies text (prompted or unprompted)
     raw_input = message.text.strip()
+    awaiting = user_data.get("awaiting") if isinstance(user_data, dict) else None
     is_cookie_text = (
-        (isinstance(user_data, dict) and user_data.get("awaiting") == "cookies")
+        (awaiting in ("cookies", "cookies_yt", "cookies_ig", "cookies_all"))
         or raw_input.startswith(("# Netscape", "# HTTP Cookie File"))
         or (".youtube.com\t" in raw_input)
+        or (".instagram.com\t" in raw_input)
     )
     if is_cookie_text:
-        if not ("youtube.com" in raw_input or "google.com" in raw_input or "# Netscape" in raw_input or "\t" in raw_input):
+        if not any(d in raw_input for d in ["youtube.com", "google.com", "instagram.com", "# Netscape", "\t"]):
             await message.reply_text(
                 "❌ **Invalid Cookies Text**\n\n"
-                "The text does not appear to contain Netscape-format YouTube cookies.\n"
+                "The text does not appear to contain Netscape-format YouTube or Instagram cookies.\n"
                 "Please make sure it has tab-separated cookie entries.",
                 parse_mode="Markdown",
             )
             return
 
         target_path = BASE_DIR / "cookies.txt"
-        target_path.write_text(raw_input, encoding="utf-8")
+        existing_text = target_path.read_text(encoding="utf-8", errors="ignore") if target_path.is_file() else ""
+        if awaiting == "cookies_all":
+            merged_text = raw_input
+            action_desc = "Full Replacement (All Cookies Overwritten)"
+        else:
+            merged_text = _merge_cookies(existing_text, raw_input)
+            if awaiting == "cookies_yt":
+                action_desc = "YouTube Updated (Instagram Preserved)"
+            elif awaiting == "cookies_ig":
+                action_desc = "Instagram Updated (YouTube Preserved)"
+            else:
+                action_desc = "Smart Merged (Both Preserved)"
 
-        has_auth = any(token in raw_input for token in ["LOGIN_INFO", "__Secure-3PSID", "SAPISID", "SID"])
-        size_kb = len(raw_input.encode("utf-8")) / 1024.0
+        target_path.write_text(merged_text, encoding="utf-8")
+
+        yt_badge, ig_badge = _format_cookies_badge(merged_text)
+        size_kb = target_path.stat().st_size / 1024.0
 
         if isinstance(user_data, dict):
             user_data["awaiting"] = None
 
-        auth_badge = "✅ Authenticated (Active login session)" if has_auth else "⚠️ Warning: No login tokens detected (Guest session)"
         await message.reply_text(
-            f"🍪 **YouTube Cookies Updated Successfully!**\n\n"
-            f"• **Method**: Pasted text saved to `{target_path.name}`\n"
+            f"🍪 **Cookies Updated Successfully!**\n\n"
+            f"• **Action**: {action_desc}\n"
+            f"• **Destination**: `{target_path.name}`\n"
             f"• **File Size**: `{size_kb:.1f} KB`\n"
-            f"• **Session**: {auth_badge}\n\n"
-            f"✨ All future YouTube downloads will use these cookies immediately.",
+            f"• **YouTube Session**: {yt_badge}\n"
+            f"• **Instagram Session**: {ig_badge}\n\n"
+            f"✨ All future downloads (YouTube & Instagram) will use these cookies immediately.",
             parse_mode="Markdown",
         )
-        logger.info("Successfully updated cookies.txt via pasted text (size: %.1f KB, authenticated=%s)", size_kb, has_auth)
+        logger.info("Successfully updated cookies.txt via pasted text (size: %.1f KB, action=%s, YT=%s, IG=%s)", size_kb, action_desc, yt_badge, ig_badge)
         return
 
     match = MEDIA_URL_REGEX.search(message.text)
