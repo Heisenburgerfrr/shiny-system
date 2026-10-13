@@ -680,16 +680,39 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # Stage 2: YouTube URL Detection & Download Pipeline
 # =====================================================================
 
+def _clean_title(title: Optional[str]) -> str:
+    """Sanitizes titles so markdown control characters (*, _, `, [, ]) never break Telegram formatting."""
+    if not title:
+        return "Instagram Reel"
+    # Replace underscores with spaces and remove markdown delimiters
+    clean = str(title).replace("_", " ").replace("*", "").replace("`", "").replace("[", "(").replace("]", ")")
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean[:80] or "Instagram Reel"
+
+
 async def _update_progress_message(
     status_msg: Message,
     text: str,
 ) -> None:
-    """Safely edits the status message without crashing on Telegram API errors."""
+    """Safely edits the status message with automatic fallback to plain text if Markdown parsing fails."""
     try:
         await status_msg.edit_text(text, parse_mode="Markdown")
     except Exception as exc:
-        # Ignore Telegram 'Message is not modified' or minor rate-limit blips
-        logger.debug("Minor exception editing progress message: %s", exc)
+        err_str = str(exc)
+        if "Message is not modified" in err_str:
+            return
+        # If Telegram rejected Markdown (e.g. Can't parse entities due to special characters):
+        try:
+            plain = (
+                text.replace("**", "")
+                .replace("`", "")
+                .replace("*", "")
+                .replace("_", " ")
+            )
+            await status_msg.edit_text(plain, parse_mode=None)
+        except Exception as fallback_exc:
+            if "Message is not modified" not in str(fallback_exc):
+                logger.debug("Minor exception editing progress message: %s", fallback_exc)
 
 
 async def _run_download_background(
@@ -740,6 +763,7 @@ async def _run_download_background(
         # Step 1 Success notification & transition to Step 2
         duration_str = _format_seconds(result.duration)
         size_str = _format_bytes(result.file_size)
+        clean_title = _clean_title(result.title)
         logger.info("[%s] Download succeeded: '%s' (%s). Starting processing...", job_id, result.title, size_str)
 
         # Branch for multi-slide carousel posts
@@ -756,14 +780,14 @@ async def _run_download_background(
         async def on_queue_wait(position: int) -> None:
             wait_text = (
                 f"⏳ **Waiting in Render Queue...**\n\n"
-                f"🎬 **{result.title}**\n\n"
+                f"🎬 **{clean_title}**\n\n"
                 f"Position: `#{position}` in queue (Rendering 1 at a time to prevent server overload)"
             )
             await _update_progress_message(status_msg, wait_text)
 
         proc_start_msg = (
             f"⚡ **Processing Video...**\n\n"
-            f"🎬 **{result.title}**\n\n"
+            f"🎬 **{clean_title}**\n\n"
             f"⚙️ Optimizing video format..."
         )
         await _update_progress_message(status_msg, proc_start_msg)
@@ -780,7 +804,7 @@ async def _run_download_background(
                 bar = "█" * filled + "░" * (bar_len - filled)
                 p_text = (
                     f"⚡ **Processing Video...**\n\n"
-                    f"🎬 **{result.title}**\n\n"
+                    f"🎬 **{clean_title}**\n\n"
                     f"✂️ **Rendering**: `[{bar}] {pct}%`"
                 )
                 asyncio.run_coroutine_threadsafe(
@@ -807,7 +831,7 @@ async def _run_download_background(
         job_store.start_azure_upload(job_id)
         upload_msg = (
             f"⚡ **Processing Reel...**\n\n"
-            f"🎬 **{result.title}**\n\n"
+            f"🎬 **{clean_title}**\n\n"
             f"☁️ Uploading to cloud storage..."
         )
         await _update_progress_message(status_msg, upload_msg)
@@ -851,7 +875,7 @@ async def _run_download_background(
                 await _update_progress_message(
                     status_msg,
                     f"⚡ **Publishing Reel...**\n\n"
-                    f"🎬 **{result.title}**\n\n"
+                    f"🎬 **{clean_title}**\n\n"
                     f"🚀 Publishing to Instagram...",
                 )
                 asyncio.create_task(_run_instagram_publish_background(job_id, existing_caption, status_msg))
@@ -860,7 +884,7 @@ async def _run_download_background(
                 job_store.set_awaiting_caption(job_id)
                 prompt_msg = (
                     f"🎬 **Video Ready!**\n\n"
-                    f"**{result.title}**\n\n"
+                    f"**{clean_title}**\n\n"
                     f"💬 Send the caption for this Reel, or `/skip` to publish directly."
                 )
                 await _update_progress_message(status_msg, prompt_msg)
@@ -951,7 +975,7 @@ async def _run_instagram_publish_background(
         now = time.monotonic()
         if now - last_update_time >= 3.0:
             last_update_time = now
-            title = job.get("title") or "Instagram Reel"
+            title = _clean_title(job.get("title"))
             msg_text = (
                 f"⚡ **Publishing Reel...**\n\n"
                 f"🎬 **{title}**\n\n"
@@ -972,7 +996,7 @@ async def _run_instagram_publish_background(
         storage_cleaner.cleanup_job_local_files(job_id)
         failure_tracker.record_success("instagram_publish")
 
-        title = job.get("title") or "Instagram Reel"
+        title = _clean_title(job.get("title"))
         success_msg = (
             f"🎉 **Reel Published!**\n\n"
             f"🎬 **{title}**\n\n"
@@ -1044,13 +1068,14 @@ async def _handle_carousel_pipeline(
     """Handles multi-slide Instagram carousel posts (videos, images, or mixed)."""
     items = result.carousel_items or []
     total = len(items)
+    clean_title = _clean_title(result.title)
     logger.info("[%s] Beginning carousel pipeline with %d slides...", job_id, total)
 
     try:
         await _update_progress_message(
             status_msg,
             f"⚡ **Processing Carousel Post...**\n\n"
-            f"📸 **{result.title}**\n\n"
+            f"📸 **{clean_title}**\n\n"
             f"Found {total} slides. Preparing media for Instagram...",
         )
 
@@ -1143,7 +1168,7 @@ async def _handle_carousel_pipeline(
         await _update_progress_message(
             status_msg,
             f"⚡ **Publishing Carousel...**\n\n"
-            f"📸 **{result.title}** ({total} slides)\n\n"
+            f"📸 **{clean_title}** ({total} slides)\n\n"
             f"🚀 Publishing to Instagram...",
         )
         asyncio.create_task(
@@ -1152,7 +1177,7 @@ async def _handle_carousel_pipeline(
                 items=uploaded_items,
                 caption=caption,
                 status_msg=status_msg,
-                title=result.title,
+                title=clean_title,
             )
         )
 
@@ -1187,6 +1212,7 @@ async def _run_instagram_carousel_publish_background(
         task_registry.register_task(job_id, current_task)
 
     job_store.start_publishing(job_id, caption=caption)
+    clean_car_title = _clean_title(title)
     last_update_time = 0.0
 
     async def publish_progress(status_code: str, elapsed: float) -> None:
@@ -1196,7 +1222,7 @@ async def _run_instagram_carousel_publish_background(
             last_update_time = now
             msg_text = (
                 f"⚡ **Publishing Carousel...**\n\n"
-                f"📸 **{title}** ({len(items)} slides)\n\n"
+                f"📸 **{clean_car_title}** ({len(items)} slides)\n\n"
                 f"🚀 Rendering on Instagram ({int(elapsed)}s)..."
             )
             await _update_progress_message(status_msg, msg_text)
@@ -1215,7 +1241,7 @@ async def _run_instagram_carousel_publish_background(
         permalink = publish_res.get("permalink", "https://instagram.com")
         success_msg = (
             f"🎉 **Carousel Published!**\n\n"
-            f"📸 **{title}** ({len(items)} slides)\n\n"
+            f"📸 **{clean_car_title}** ({len(items)} slides)\n\n"
             f"👉 [Watch on Instagram]({permalink})"
         )
         await _update_progress_message(status_msg, success_msg)
