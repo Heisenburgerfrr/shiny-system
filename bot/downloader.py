@@ -136,6 +136,21 @@ try:
     _orig_extract_product = InstagramBaseIE._extract_product
 
     def _patched_extract_product(self, product_info, *args, **kwargs):
+        from yt_dlp.utils import traverse_obj
+        if isinstance(product_info, list) and product_info:
+            p_info = product_info[0]
+        elif isinstance(product_info, dict):
+            p_info = product_info
+        else:
+            p_info = {}
+
+        # If product_info came from GraphQL, carousel slides are under edge_sidecar_to_children
+        if "carousel_media" not in p_info:
+            sidecar_nodes = traverse_obj(p_info, ('edge_sidecar_to_children', 'edges', ..., 'node', {dict}))
+            if sidecar_nodes:
+                p_info["carousel_media"] = sidecar_nodes
+                logger.info("Detected %d carousel slides in edge_sidecar_to_children", len(sidecar_nodes))
+
         info_dict = _orig_extract_product(self, product_info, *args, **kwargs)
         # Exhaustively search product_info for any attached music/audio
         music_url = extract_instagram_audio_url(product_info)

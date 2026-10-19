@@ -1597,19 +1597,19 @@ async def _handle_single_image_with_audio_pipeline(
 ) -> None:
     """
     Handles single Instagram photo/image posts that have an attached audio track.
-    Renders the image and audio into a full video Reel so the audio plays natively on Instagram!
+    Renders the image and audio into a 2-slide Carousel feed post so the audio plays natively on Instagram without being a Reel!
     """
     clean_title = _clean_title(result.title)
     source_path = Path(result.file_path)
     audio_path = Path(result.audio_file)
-    logger.info("[%s] Beginning single photo with audio pipeline: img=%s, audio=%s", job_id, source_path.name, audio_path.name)
+    logger.info("[%s] Beginning single photo with audio carousel pipeline: img=%s, audio=%s", job_id, source_path.name, audio_path.name)
 
     try:
         await _update_progress_message(
             status_msg,
-            f"⚡ **Processing Video Reel...**\n\n"
-            f"🎬 **{clean_title}**\n\n"
-            f"🎵 Baking attached audio into Reel...",
+            f"⚡ **Processing Carousel Post...**\n\n"
+            f"📸 **{clean_title}**\n\n"
+            f"🎵 Adding background audio to carousel...",
         )
 
         processed_img_path = PROCESSED_DIR / f"{job_id}_frame.jpg"
@@ -1680,23 +1680,31 @@ async def _handle_single_image_with_audio_pipeline(
         )
         await proc.wait()
 
-        # Upload rendered Reel to Azure Blob Storage
+        # Upload video slides to Azure Blob Storage for Carousel publishing
+        # (Instagram Carousels require at least 2 items, so we create a 2-slide carousel with the audio baked in)
         await _update_progress_message(
             status_msg,
-            f"☁️ **Uploading Reel...**\n\n"
-            f"🎬 **{clean_title}**\n\n"
-            f"Uploading to cloud storage...",
+            f"☁️ **Uploading Carousel Slides...**\n\n"
+            f"📸 **{clean_title}**\n\n"
+            f"Uploading slides to cloud storage...",
         )
-        upload_data = await azure_storage_manager.upload_video_blob(
+        upload_data_1 = await azure_storage_manager.upload_media_blob(
             job_id=job_id,
             file_path=str(rendered_video_path),
+            blob_name=f"{job_id}_slide_1.mp4",
+            content_type="video/mp4",
         )
-        job_store.complete_azure_upload(
+        upload_data_2 = await azure_storage_manager.upload_media_blob(
             job_id=job_id,
-            blob_name=upload_data["blob_name"],
-            sas_url=upload_data["sas_url"],
-            expires_at=upload_data["expires_at"],
+            file_path=str(rendered_video_path),
+            blob_name=f"{job_id}_slide_2.mp4",
+            content_type="video/mp4",
         )
+
+        uploaded_items = [
+            {"url": upload_data_1["sas_url"], "type": "VIDEO"},
+            {"url": upload_data_2["sas_url"], "type": "VIDEO"},
+        ]
 
         job = job_store.get_job(job_id)
         caption = (job.get("caption") if job else None) or resolve_job_caption(result, job_id)
@@ -1704,26 +1712,28 @@ async def _handle_single_image_with_audio_pipeline(
 
         await _update_progress_message(
             status_msg,
-            f"⚡ **Publishing Reel...**\n\n"
-            f"🎬 **{clean_title}**\n\n"
+            f"⚡ **Publishing Carousel...**\n\n"
+            f"📸 **{clean_title}**\n\n"
             f"🚀 Publishing to Instagram...",
         )
         asyncio.create_task(
-            _run_instagram_publish_background(
+            _run_instagram_carousel_publish_background(
                 job_id=job_id,
+                items=uploaded_items,
                 caption=caption,
                 status_msg=status_msg,
+                title=clean_title,
             )
         )
 
     except Exception as exc:
         err_msg = str(exc)
-        logger.error("[%s] Single image with audio pipeline failed: %s", job_id, err_msg, exc_info=True)
+        logger.error("[%s] Single image with audio carousel pipeline failed: %s", job_id, err_msg, exc_info=True)
         job_store.fail_processing(job_id, err_msg)
         storage_cleaner.cleanup_job_local_files(job_id)
         await _update_progress_message(
             status_msg,
-            f"❌ **Reel Processing Failed**\n\n"
+            f"❌ **Carousel Processing Failed**\n\n"
             f"• **Job ID**: `{job_id}`\n"
             f"• **Reason**: {err_msg[:200]}\n\n"
             f"Use `/retry {job_id}` to retry.",
