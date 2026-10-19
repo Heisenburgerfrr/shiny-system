@@ -37,6 +37,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "🔄 [1/4] Pulling latest updates from branch '$BRANCH'..."
+# Stash runtime changes (like storage/jobs.db) to ensure smooth pulls
+git stash --quiet 2>/dev/null || true
 git fetch origin "$BRANCH"
 git checkout "$BRANCH"
 git pull origin "$BRANCH"
