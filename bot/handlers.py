@@ -1360,21 +1360,69 @@ async def _handle_carousel_pipeline(
                     logger.warning("[%s] Pillow processing failed for slide %d: %s. Copying original...", job_id, idx, img_err)
                     shutil.copy2(source_path, processed_img_path)
 
-                await _update_progress_message(
-                    status_msg,
-                    f"☁️ **Uploading Carousel ({idx}/{total})...**\n\n"
-                    f"Uploading image slide {idx} to cloud storage...",
-                )
-                upload_data = await azure_storage_manager.upload_media_blob(
-                    job_id=job_id,
-                    file_path=str(processed_img_path),
-                    blob_name=f"{job_id}_slide_{idx}.jpg",
-                    content_type="image/jpeg",
-                )
-                uploaded_items.append({
-                    "url": upload_data["sas_url"],
-                    "type": "IMAGE",
-                })
+                # If post has attached audio, bake it into a video slide so sound plays on Instagram!
+                if result.audio_file and Path(result.audio_file).is_file():
+                    await _update_progress_message(
+                        status_msg,
+                        f"⚡ **Processing Carousel ({idx}/{total})...**\n\n"
+                        f"🎵 Adding background audio to slide {idx}...",
+                    )
+                    processed_slide_path = PROCESSED_DIR / f"{job_id}_slide_{idx}.mp4"
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-loop", "1",
+                        "-i", str(processed_img_path),
+                        "-i", str(result.audio_file),
+                        "-c:v", "libx264",
+                        "-preset", "veryfast",
+                        "-crf", "17",
+                        "-tune", "stillimage",
+                        "-c:a", "aac",
+                        "-b:a", "320k",
+                        "-pix_fmt", "yuv420p",
+                        "-movflags", "+faststart",
+                        "-t", "7.0",
+                        "-shortest",
+                        str(processed_slide_path),
+                    ]
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await proc.wait()
+
+                    await _update_progress_message(
+                        status_msg,
+                        f"☁️ **Uploading Carousel ({idx}/{total})...**\n\n"
+                        f"Uploading video slide {idx} with audio...",
+                    )
+                    upload_data = await azure_storage_manager.upload_media_blob(
+                        job_id=job_id,
+                        file_path=str(processed_slide_path),
+                        blob_name=f"{job_id}_slide_{idx}.mp4",
+                        content_type="video/mp4",
+                    )
+                    uploaded_items.append({
+                        "url": upload_data["sas_url"],
+                        "type": "VIDEO",
+                    })
+                else:
+                    await _update_progress_message(
+                        status_msg,
+                        f"☁️ **Uploading Carousel ({idx}/{total})...**\n\n"
+                        f"Uploading image slide {idx} to cloud storage...",
+                    )
+                    upload_data = await azure_storage_manager.upload_media_blob(
+                        job_id=job_id,
+                        file_path=str(processed_img_path),
+                        blob_name=f"{job_id}_slide_{idx}.jpg",
+                        content_type="image/jpeg",
+                    )
+                    uploaded_items.append({
+                        "url": upload_data["sas_url"],
+                        "type": "IMAGE",
+                    })
 
         # All slides processed and uploaded to Azure!
         job = job_store.get_job(job_id)

@@ -41,7 +41,7 @@ The codebase is structured to run **two separate bots for two different Instagra
 - **Azure Blob Storage**: **Verified & Reachable** (`memoxz.blob.core.windows.net`, Container `ig-uploads` / `Standard_LRS`).
 - **Video Engine (FFmpeg)**: Configured with CRF 17 master quality, 320k AAC, anti-fingerprint filters, and Premiere Pro metadata.
 - **Render Concurrency**: Enforced at `max_concurrent_renders = 1` via `AsyncRenderQueue` to prevent CPU lockups.
-- **Photo & Carousel Publishing**: Supported for single image/meme posts, 2–10 image/video carousels, and mixed media with automated aspect-ratio padding (matching slide 1's ratio) and Pillow RGB optimization.
+- **Photo & Carousel Publishing**: Supported for single image/meme posts, 2–10 image/video carousels, and mixed media with automated aspect-ratio padding (matching slide 1's ratio) and Pillow RGB optimization. When posts have background music/audio, audio is automatically downloaded and baked into video slides so sound plays natively on Instagram while preserving the swipeable carousel feed post format.
 - **Caption System**: Defaulted to OFF (preserves original post title & caption from Instagram/YouTube); when toggled ON, uses custom template/suffix.
 
 ---

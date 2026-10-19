@@ -66,10 +66,28 @@ try:
                 })
         return res
 
+    _orig_extract_product = InstagramBaseIE._extract_product
+
+    def _patched_extract_product(self, product_info, *args, **kwargs):
+        info_dict = _orig_extract_product(self, product_info, *args, **kwargs)
+        from yt_dlp.utils import traverse_obj
+        p_info = product_info[0] if isinstance(product_info, list) and product_info else product_info if isinstance(product_info, dict) else {}
+        music_url = (
+            traverse_obj(p_info, ('music_metadata', 'music_info', 'music_asset_info', 'progressive_download_url'))
+            or traverse_obj(p_info, ('clips_metadata', 'music_info', 'music_asset_info', 'progressive_download_url'))
+            or traverse_obj(p_info, ('clips_metadata', 'original_sound_info', 'progressive_download_url'))
+            or traverse_obj(p_info, ('music_info', 'music_asset_info', 'progressive_download_url'))
+            or traverse_obj(p_info, ('story_music_stickers', 0, 'music_asset_info', 'progressive_download_url'))
+        )
+        if music_url:
+            info_dict['music_url'] = music_url
+        return info_dict
+
     InstagramBaseIE._extract_product_media = _patched_extract_product_media
-    logger.debug("Successfully applied image-support patch to InstagramBaseIE._extract_product_media")
+    InstagramBaseIE._extract_product = _patched_extract_product
+    logger.debug("Successfully applied image & music support patches to InstagramBaseIE")
 except Exception as patch_err:
-    logger.warning("Could not patch InstagramBaseIE._extract_product_media: %s", patch_err)
+    logger.warning("Could not patch InstagramBaseIE: %s", patch_err)
 
 
 @dataclass
@@ -84,6 +102,7 @@ class DownloadResult:
     is_image: bool = False
     carousel_items: Optional[List[Dict[str, Any]]] = None
     caption: Optional[str] = None
+    audio_file: Optional[str] = None
 
 
 class DownloadCategory:
@@ -402,15 +421,37 @@ class YouTubeDownloader:
                             title = title[:57] + "..."
                         duration = info.get("duration")
 
+                        # Check for attached background music / audio track
+                        audio_file_path = None
+                        music_url = info.get("music_url")
+                        if not music_url and info.get("entries"):
+                            for ent in info.get("entries", []):
+                                if ent and ent.get("music_url"):
+                                    music_url = ent.get("music_url")
+                                    break
+
+                        if music_url:
+                            try:
+                                import httpx
+                                audio_dest = DOWNLOADS_DIR / f"{job_id}_audio.mp4"
+                                with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+                                    resp = client.get(music_url)
+                                    if resp.status_code == 200 and len(resp.content) > 1000:
+                                        audio_dest.write_bytes(resp.content)
+                                        audio_file_path = str(audio_dest.resolve())
+                                        logger.info("[%s] Downloaded attached Instagram audio track (%d bytes)", job_id, len(resp.content))
+                            except Exception as audio_err:
+                                logger.warning("[%s] Failed to download attached audio track: %s", job_id, audio_err)
+
                         job_dir = DOWNLOADS_DIR / job_id
                         found_files = []
                         if job_dir.exists():
                             for f in sorted(job_dir.glob("*")):
-                                if f.is_file() and not f.name.endswith((".part", ".ytdl")):
+                                if f.is_file() and not f.name.endswith((".part", ".ytdl")) and not f.name.endswith("_audio.mp4"):
                                     found_files.append(f)
                         if not found_files:
                             for f in sorted(DOWNLOADS_DIR.glob(f"{job_id}*")):
-                                if f.is_file() and not f.name.endswith((".part", ".ytdl")):
+                                if f.is_file() and not f.name.endswith((".part", ".ytdl")) and not f.name.endswith("_audio.mp4"):
                                     found_files.append(f)
 
                         if not found_files:
@@ -442,6 +483,7 @@ class YouTubeDownloader:
                                 is_carousel=False,
                                 is_image=is_img,
                                 caption=raw_caption,
+                                audio_file=audio_file_path,
                             )
 
                         # Case B: Multi-item Carousel post
@@ -474,6 +516,7 @@ class YouTubeDownloader:
                             is_carousel=True,
                             carousel_items=items,
                             caption=raw_caption,
+                            audio_file=audio_file_path,
                         )
                 except Exception as exc:
                     last_exception = exc
