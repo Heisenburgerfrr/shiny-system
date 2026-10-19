@@ -4,11 +4,11 @@ A Telegram bot that downloads YouTube videos, processes and re-encodes them with
 
 ---
 
-## Current Status: Stage 3 (Memoxz Video Processing via FFmpeg) Complete
+## Current Status: Stage 3 (Unshockabl Video Processing via FFmpeg) Complete
 
 - **Stage 1 (Complete)**: Bot skeleton, environment configuration, structured logging, access control, `/start`, and `/status` diagnostics.
 - **Stage 2 (Complete)**: YouTube link detection, non-blocking background downloader using `yt_dlp`, persistent SQLite job store (`storage/jobs.db`), live throttled Telegram progress edits, cloud IP workarounds (cookies, player client rotation, proxy support), error classification, and interrupted job auto-recovery.
-- **Stage 3 (Complete)**: Memoxz studio-grade video processing engine (from `Wel/main.py`), applying anti-fingerprint visual/acoustic hash breakup, Adobe Premiere Pro CC 2024 metadata injection, CRF 17 visually lossless master quality, 320k AAC audio, real-time render progress bar to Telegram, and automated source cleanup.
+- **Stage 3 (Complete)**: Unshockabl studio-grade video processing engine, applying anti-fingerprint visual/acoustic hash breakup, Adobe Premiere Pro CC 2024 metadata injection, CRF 17 visually lossless master quality, 320k AAC audio, real-time render progress bar to Telegram, and automated source cleanup.
 - **Stage 4 (Upcoming)**: Cover image handling & Azure Blob upload & Instagram publishing.
 
 ---
@@ -22,7 +22,7 @@ A Telegram bot that downloads YouTube videos, processes and re-encodes them with
 │   ├── config.py          # Environment variable loading & validation
 │   ├── db.py              # SQLite job store (storage/jobs.db) & recovery
 │   ├── downloader.py      # yt-dlp downloader, retries, and error classification
-│   ├── processor.py       # Memoxz FFmpeg engine, anti-fingerprint layer, Premiere metadata
+│   ├── processor.py       # Unshockabl FFmpeg engine, anti-fingerprint layer, Premiere metadata
 │   ├── handlers.py        # /start, /status, download & processing pipeline handlers
 │   ├── logger.py          # Structured logging (stdout + rotating file)
 │   └── main.py            # Entry point, polling loop, startup job recovery
@@ -43,9 +43,9 @@ A Telegram bot that downloads YouTube videos, processes and re-encodes them with
 
 ---
 
-## Video Processing Engine (Memoxz Anti-Fingerprint Layer)
+## Video Processing Engine (Unshockabl Anti-Fingerprint Layer)
 
-The bot integrates the high-performance Memoxz video processing pipeline:
+The bot integrates the high-performance Unshockabl video processing pipeline:
 
 1. **Visual Hash Breakup (Anti-Fingerprint)**:
    - Dynamic micro-zoom and even-dimension crop (`scale=trunc(iw*crop_factor/2)*2...`) ensuring hardware acceleration speed.

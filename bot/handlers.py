@@ -1867,7 +1867,7 @@ async def process_video(
 ) -> ProcessedResult:
     """
     Public entry point for video processing.
-    Uses Memoxz VideoProcessor implemented in Stage 3.
+    Uses Unshockabl VideoProcessor implemented in Stage 3.
     """
     return await video_processor.process_video(
         job_id=job_id,

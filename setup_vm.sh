@@ -42,12 +42,12 @@ echo "📁 [4/6] Ensuring storage directories exist..."
 mkdir -p storage/downloads storage/processed storage/temp logs
 
 echo "⚙️ [5/6] Configuring systemd background service..."
-SERVICE_FILE="/etc/systemd/system/memoxz.service"
+SERVICE_FILE="/etc/systemd/system/unshockabl.service"
 CURRENT_USER="$(whoami)"
 
 sudo bash -c "cat <<EOF > $SERVICE_FILE
 [Unit]
-Description=Memoxz YouTube to Instagram Reels Telegram Bot
+Description=Unshockabl YouTube to Instagram Reels Telegram Bot
 After=network.target
 
 [Service]
@@ -68,12 +68,12 @@ EOF"
 
 echo "🔄 [6/6] Reloading systemd & starting bot..."
 sudo systemctl daemon-reload
-sudo systemctl enable memoxz
-sudo systemctl restart memoxz
+sudo systemctl enable unshockabl
+sudo systemctl restart unshockabl
 
 echo ""
 echo "=============================================================================="
 echo "🎉 DEPLOYMENT COMPLETE!"
-echo "• Bot Status: run 'sudo systemctl status memoxz'"
+echo "• Bot Status: run 'sudo systemctl status unshockabl'"
 echo "• Live Logs:  run 'tail -f logs/systemd_stdout.log' or 'tail -f logs/bot.log'"
 echo "=============================================================================="

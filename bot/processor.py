@@ -1,4 +1,4 @@
-"""Video processing engine using ffmpeg with Memoxz anti-fingerprint layer and Premiere Pro metadata."""
+"""Video processing engine using ffmpeg with Unshockabl anti-fingerprint layer and Premiere Pro metadata."""
 
 import asyncio
 import json
@@ -148,7 +148,7 @@ def get_filter_complex(preset: str = "balanced") -> Tuple[str, str]:
 
 class VideoProcessor:
     """
-    Executes the Memoxz studio-grade video processing pipeline using ffmpeg:
+    Executes the Unshockabl studio-grade video processing pipeline using ffmpeg:
     - Anti-fingerprint visual and acoustic hash breakup
     - Stripping original metadata and injecting Adobe Premiere Pro 2024 tags
     - Master visual quality: CRF 17, 320k AAC, yuv420p, +faststart
@@ -255,7 +255,7 @@ class VideoProcessor:
             str(output_path),
         ]
 
-        logger.info("[%s] Launching FFmpeg with Memoxz engine (CRF 17, 320k AAC)...", job_id)
+        logger.info("[%s] Launching FFmpeg with Unshockabl engine (CRF 17, 320k AAC)...", job_id)
 
         process = await asyncio.create_subprocess_exec(
             *cmd,

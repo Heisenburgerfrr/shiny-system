@@ -1,0 +1,17 @@
+[Unit]
+Description=Unshockabl YouTube to Instagram Reels Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=azureuser
+WorkingDirectory=/home/azureuser/unshockabl
+ExecStart=/home/azureuser/unshockabl/venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/azureuser/unshockabl/.env
+StandardOutput=append:/home/azureuser/unshockabl/logs/systemd_stdout.log
+StandardError=append:/home/azureuser/unshockabl/logs/systemd_stderr.log
+
+[Install]
+WantedBy=multi-user.target
