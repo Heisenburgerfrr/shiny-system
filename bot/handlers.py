@@ -1345,15 +1345,25 @@ async def _handle_carousel_pipeline(
                             if curr_ratio > target_aspect_ratio:
                                 # Wider than target: pad height (top & bottom)
                                 new_height = int(round(rgb_img.width / target_aspect_ratio))
+                                if new_height % 2 != 0:
+                                    new_height += 1
                                 canvas = Image.new("RGB", (rgb_img.width, new_height), (0, 0, 0))
                                 canvas.paste(rgb_img, (0, (new_height - rgb_img.height) // 2))
                                 rgb_img = canvas
                             else:
                                 # Taller than target: pad width (left & right)
                                 new_width = int(round(rgb_img.height * target_aspect_ratio))
+                                if new_width % 2 != 0:
+                                    new_width += 1
                                 canvas = Image.new("RGB", (new_width, rgb_img.height), (0, 0, 0))
                                 canvas.paste(rgb_img, ((new_width - rgb_img.width) // 2, 0))
                                 rgb_img = canvas
+
+                        # Ensure both width and height are even for video encoding compatibility
+                        if rgb_img.width % 2 != 0 or rgb_img.height % 2 != 0:
+                            even_w = rgb_img.width if rgb_img.width % 2 == 0 else rgb_img.width - 1
+                            even_h = rgb_img.height if rgb_img.height % 2 == 0 else rgb_img.height - 1
+                            rgb_img = rgb_img.crop((0, 0, even_w, even_h))
 
                         rgb_img.save(processed_img_path, format="JPEG", quality=95, optimize=True)
                 except Exception as img_err:
@@ -1373,6 +1383,7 @@ async def _handle_carousel_pipeline(
                         "-loop", "1",
                         "-i", str(processed_img_path),
                         "-i", str(result.audio_file),
+                        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
                         "-c:v", "libx264",
                         "-preset", "veryfast",
                         "-crf", "17",
@@ -1482,12 +1493,16 @@ async def _run_instagram_carousel_publish_background(
     async def publish_progress(status_code: str, elapsed: float) -> None:
         nonlocal last_update_time
         now = time.monotonic()
-        if now - last_update_time >= 3.0:
+        if now - last_update_time >= 2.5:
             last_update_time = now
+            if isinstance(status_code, str) and (" " in status_code or not status_code.isupper()):
+                stage_desc = status_code
+            else:
+                stage_desc = f"Rendering on Instagram ({int(elapsed)}s)..."
             msg_text = (
                 f"⚡ **Publishing Carousel...**\n\n"
                 f"📸 **{clean_car_title}** ({len(items)} slides)\n\n"
-                f"🚀 Rendering on Instagram ({int(elapsed)}s)..."
+                f"🚀 {stage_desc}"
             )
             await _update_progress_message(status_msg, msg_text)
 

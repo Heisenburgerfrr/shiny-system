@@ -314,6 +314,11 @@ class InstagramPublisher:
                 if status_code == "EXPIRED":
                     raise InstagramPublishError("Container expired before it could be published.")
 
+                # If status_code is not returned at all by Meta (e.g. parent container in certain API versions)
+                if not status_code and elapsed >= 3.0:
+                    logger.info("Container %s has no status_code after %.1fs; proceeding to publish.", container_id, elapsed)
+                    return container_id
+
                 # Still IN_PROGRESS
                 if progress_callback:
                     try:
@@ -329,9 +334,11 @@ class InstagramPublisher:
 
                 await asyncio.sleep(self.poll_interval)
 
-    async def publish_container(self, container_id: str, max_retries: int = 5) -> str:
+    async def publish_container(self, container_id: str, max_retries: int = 8) -> str:
         """
-        Step 3: Publishes the finished container with automatic retries for transient Meta server errors (subcode 2207085, code -1, 5xx).
+        Step 3: Publishes the finished container with automatic retries for transient Meta server errors.
+        Handles Meta code 9007 / subcode 2207027 (Media ID is not available / not ready yet),
+        subcode 2207085, code -1, 1, 2, and 5xx errors with exponential backoff.
         POST /{ig-user-id}/media_publish
         Returns the published media ID.
         """
@@ -357,15 +364,19 @@ class InstagramPublisher:
             exc = _classify_meta_error(err_dict, resp.status_code)
             code = err_dict.get("code", 0)
             subcode = err_dict.get("error_subcode", 0)
+            err_msg_lower = str(exc).lower()
 
-            # Meta subcode 2207085 / code -1 is documented as a transient internal server error
+            # Meta subcode 2207085 / 2207027 / code 9007 ("Media ID is not available") / code -1
+            # occurs when Meta is still transcoding or assembling the container.
             is_transient = (
-                code in (-1, 1, 2)
-                or subcode == 2207085
+                code in (-1, 1, 2, 9007)
+                or subcode in (2207027, 2207085)
+                or "media id is not available" in err_msg_lower
+                or "not ready for publishing" in err_msg_lower
                 or resp.status_code >= 500
             )
 
-            # Check if Meta actually published the Reel despite returning an error code
+            # Check if Meta actually published the Reel/Carousel despite returning an error code
             if is_transient:
                 try:
                     async with httpx.AsyncClient(timeout=10.0) as verify_client:
@@ -383,13 +394,14 @@ class InstagramPublisher:
                     logger.debug("Non-fatal error verifying recent media: %s", check_exc)
 
             if is_transient and attempt < max_retries:
-                backoff = attempt * 3.0  # 3s, 6s, 9s, 12s
+                backoff = attempt * 4.0  # 4s, 8s, 12s, 16s, 20s, 24s, 28s
                 logger.warning(
-                    "Publish attempt %d for container %s encountered transient Meta error (code %s, subcode %s). Retrying in %.1fs...",
+                    "Publish attempt %d for container %s encountered transient Meta status (code %s, subcode %s: %s). Waiting %.1fs for Meta to finalize media ID...",
                     attempt,
                     container_id,
                     code,
                     subcode,
+                    err_dict.get("message", "N/A"),
                     backoff,
                 )
                 await asyncio.sleep(backoff)
@@ -562,8 +574,9 @@ class InstagramPublisher:
         2. Create child container for each slide (video or image)
         3. Poll status for each child container
         4. Create parent CAROUSEL container
-        5. Publish parent container
-        6. Fetch live permalink
+        5. Poll parent CAROUSEL container until ready
+        6. Publish parent container
+        7. Fetch live permalink
         """
         allowed, count = self.check_rate_limit()
         if not allowed:
@@ -599,7 +612,7 @@ class InstagramPublisher:
 
         # 3. Create parent carousel container
         if progress_callback:
-            await progress_callback("Finalizing carousel...", 85.0)
+            await progress_callback("Finalizing carousel on Instagram...", 85.0)
 
         parent_container_id = await self.create_carousel_parent_container(
             children_ids=child_container_ids,
@@ -607,16 +620,21 @@ class InstagramPublisher:
         )
         job_store.record_container_created(job_id, parent_container_id)
 
-        # 4. Publish parent container
+        # 4. Poll parent carousel container until ready
+        if progress_callback:
+            await progress_callback("Assembling carousel slides...", 90.0)
+        await self.poll_container_status(parent_container_id)
+
+        # 5. Publish parent container
         if progress_callback:
             await progress_callback("Publishing carousel...", 95.0)
 
         media_id = await self.publish_container(parent_container_id)
 
-        # 5. Fetch live permalink
+        # 6. Fetch live permalink
         permalink = await self.get_media_permalink(media_id)
 
-        # 6. Update SQLite record
+        # 7. Update SQLite record
         job_store.complete_publishing(job_id=job_id, media_id=media_id, permalink=permalink)
 
         return {

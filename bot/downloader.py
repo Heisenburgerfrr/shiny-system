@@ -403,8 +403,13 @@ class YouTubeDownloader:
 
         # 1. Instagram Download Flow (Reels, Photos & Carousels)
         if "instagram.com" in url.lower() or "instagr.am" in url.lower():
-            # Strip /share/ wrapping so yt-dlp recognizes the canonical post ID
-            clean_url = re.sub(r"/(?:share/)+(p|reel|reels|tv)/", r"/\1/", url)
+            # Canonicalize Instagram URL: extract canonical path and strip tracking/index query params
+            ig_match = re.search(r"/(?:share/)?(p|reel|reels|tv)/([A-Za-z0-9_-]+)", url)
+            if ig_match:
+                media_kind, shortcode = ig_match.groups()
+                clean_url = f"https://www.instagram.com/{media_kind}/{shortcode}/"
+            else:
+                clean_url = re.sub(r"/(?:share/)+(p|reel|reels|tv)/", r"/\1/", url).split("?")[0]
             logger.info("[%s] Downloading Instagram media: %s (canonical: %s)", job_id, url, clean_url)
             for attempt in range(1, max_network_retries + 1):
                 try:
