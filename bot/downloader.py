@@ -21,13 +21,80 @@ logger = logging.getLogger("bot.downloader")
 BASE_DIR = Path(__file__).resolve().parent.parent
 DOWNLOADS_DIR = BASE_DIR / "storage" / "downloads"
 
-# Patch yt-dlp's Instagram extractor to support image posts and image carousels
+def extract_instagram_audio_url(obj: Any) -> Optional[str]:
+    """
+    Exhaustively and recursively searches any Instagram metadata dictionary, list,
+    or dash manifest for attached audio or music download URLs.
+    """
+    if not obj:
+        return None
+
+    if isinstance(obj, str):
+        if "<BaseURL>" in obj and "</BaseURL>" in obj:
+            import html
+            urls = re.findall(r"<BaseURL>(https?://[^<>\s]+)</BaseURL>", obj)
+            for u in urls:
+                unescaped = html.unescape(u)
+                if any(ext in unescaped for ext in (".m4a", ".mp4", ".mp3", "bytestart", "audio")):
+                    return unescaped
+        elif obj.startswith("http") and any(ext in obj for ext in (".mp4", ".m4a", ".mp3", "audio")):
+            if not any(ext in obj for ext in (".jpg", ".jpeg", ".png", ".webp", ".heic")):
+                return obj
+        return None
+
+    if isinstance(obj, dict):
+        # 1. Direct audio keys
+        for key in ("progressive_download_url", "audio_src", "sound_url", "playback_url", "audio_url"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.startswith("http"):
+                return val
+
+        # 2. Check embedded dash_manifest
+        dash = obj.get("dash_manifest")
+        if isinstance(dash, str):
+            res = extract_instagram_audio_url(dash)
+            if res:
+                return res
+
+        # 3. Priority sub-dictionaries
+        for sub_key in (
+            "music_metadata", "clips_metadata", "music_info", "original_sound_info",
+            "music_asset_info", "audio", "audio_asset_info", "story_music_stickers",
+            "carousel_media"
+        ):
+            if sub_key in obj:
+                res = extract_instagram_audio_url(obj[sub_key])
+                if res:
+                    return res
+
+        # 4. Exhaustive search across all dictionary values
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                res = extract_instagram_audio_url(v)
+                if res:
+                    return res
+
+    elif isinstance(obj, list):
+        for item in obj:
+            res = extract_instagram_audio_url(item)
+            if res:
+                return res
+
+    return None
+
+
+# Patch yt-dlp's Instagram extractor to support image posts, image carousels, and attached audio
 try:
     from yt_dlp.extractor.instagram import InstagramBaseIE
     _orig_extract_product_media = InstagramBaseIE._extract_product_media
 
     def _patched_extract_product_media(self, product_media):
         res = _orig_extract_product_media(self, product_media)
+        # Check product_media for attached audio
+        media_audio = extract_instagram_audio_url(product_media)
+        if media_audio:
+            res["music_url"] = media_audio
+
         # If no video formats were found, populate formats with the highest-res image candidate
         if not res.get("formats"):
             img_url = None
@@ -70,17 +137,11 @@ try:
 
     def _patched_extract_product(self, product_info, *args, **kwargs):
         info_dict = _orig_extract_product(self, product_info, *args, **kwargs)
-        from yt_dlp.utils import traverse_obj
-        p_info = product_info[0] if isinstance(product_info, list) and product_info else product_info if isinstance(product_info, dict) else {}
-        music_url = (
-            traverse_obj(p_info, ('music_metadata', 'music_info', 'music_asset_info', 'progressive_download_url'))
-            or traverse_obj(p_info, ('clips_metadata', 'music_info', 'music_asset_info', 'progressive_download_url'))
-            or traverse_obj(p_info, ('clips_metadata', 'original_sound_info', 'progressive_download_url'))
-            or traverse_obj(p_info, ('music_info', 'music_asset_info', 'progressive_download_url'))
-            or traverse_obj(p_info, ('story_music_stickers', 0, 'music_asset_info', 'progressive_download_url'))
-        )
+        # Exhaustively search product_info for any attached music/audio
+        music_url = extract_instagram_audio_url(product_info)
         if music_url:
-            info_dict['music_url'] = music_url
+            info_dict["music_url"] = music_url
+            logger.info("Found attached Instagram music URL: %s", music_url[:80])
         return info_dict
 
     InstagramBaseIE._extract_product_media = _patched_extract_product_media
@@ -428,12 +489,49 @@ class YouTubeDownloader:
 
                         # Check for attached background music / audio track
                         audio_file_path = None
-                        music_url = info.get("music_url")
+                        music_url = info.get("music_url") or extract_instagram_audio_url(info)
                         if not music_url and info.get("entries"):
                             for ent in info.get("entries", []):
-                                if ent and ent.get("music_url"):
-                                    music_url = ent.get("music_url")
-                                    break
+                                if ent:
+                                    music_url = ent.get("music_url") or extract_instagram_audio_url(ent)
+                                    if music_url:
+                                        break
+
+                        # Secondary fallback: query Instagram media info API using shortcode
+                        if not music_url:
+                            try:
+                                ig_sc_match = re.search(r"/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", clean_url)
+                                if ig_sc_match:
+                                    sc = ig_sc_match.group(1)
+                                    from yt_dlp.extractor.instagram import _id_to_pk
+                                    media_pk = _id_to_pk(sc)
+                                    cookies_dict = {}
+                                    cookies_path = self._get_validated_cookies_path()
+                                    if cookies_path and os.path.exists(cookies_path):
+                                        with open(cookies_path, "r", encoding="utf-8", errors="ignore") as cf:
+                                            for line in cf:
+                                                if line.startswith("#") or not line.strip():
+                                                    continue
+                                                parts = line.strip().split("\t")
+                                                if len(parts) >= 7 and "instagram.com" in parts[0]:
+                                                    cookies_dict[parts[5]] = parts[6]
+
+                                    api_headers = {
+                                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                        "X-IG-App-ID": "936619743392459",
+                                        "Accept": "*/*",
+                                    }
+                                    import httpx
+                                    with httpx.Client(timeout=15.0, headers=api_headers, cookies=cookies_dict, follow_redirects=True) as client:
+                                        api_url = f"https://www.instagram.com/api/v1/media/{media_pk}/info/"
+                                        api_resp = client.get(api_url)
+                                        if api_resp.status_code == 200:
+                                            media_data = api_resp.json()
+                                            music_url = extract_instagram_audio_url(media_data)
+                                            if music_url:
+                                                logger.info("[%s] Discovered audio track via Instagram info API fallback: %s", job_id, music_url[:80])
+                            except Exception as api_fallback_err:
+                                logger.debug("[%s] Secondary Instagram audio search error: %s", job_id, api_fallback_err)
 
                         if music_url:
                             try:

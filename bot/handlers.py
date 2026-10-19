@@ -945,14 +945,25 @@ async def _run_download_background(
             return
 
         # Branch for single photo / image post
-        if getattr(result, "is_image", False) or Path(result.file_path).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
-            await _handle_single_image_pipeline(
-                job_id=job_id,
-                result=result,
-                status_msg=status_msg,
-                loop=loop,
-            )
-            return
+        is_single_image = getattr(result, "is_image", False) or Path(result.file_path).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+        if is_single_image:
+            if result.audio_file and Path(result.audio_file).is_file():
+                logger.info("[%s] Single image post has attached audio track! Converting to Reel with audio...", job_id)
+                await _handle_single_image_with_audio_pipeline(
+                    job_id=job_id,
+                    result=result,
+                    status_msg=status_msg,
+                    loop=loop,
+                )
+                return
+            else:
+                await _handle_single_image_pipeline(
+                    job_id=job_id,
+                    result=result,
+                    status_msg=status_msg,
+                    loop=loop,
+                )
+                return
 
         # Single video flow (YouTube Shorts, YouTube Video, or single Instagram Reel)
         async def on_queue_wait(position: int) -> None:
@@ -1576,6 +1587,147 @@ async def _run_instagram_carousel_publish_background(
         await _update_progress_message(status_msg, fail_msg)
     finally:
         task_registry.unregister_task(job_id)
+
+
+async def _handle_single_image_with_audio_pipeline(
+    job_id: str,
+    result: DownloadResult,
+    status_msg: Message,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """
+    Handles single Instagram photo/image posts that have an attached audio track.
+    Renders the image and audio into a full video Reel so the audio plays natively on Instagram!
+    """
+    clean_title = _clean_title(result.title)
+    source_path = Path(result.file_path)
+    audio_path = Path(result.audio_file)
+    logger.info("[%s] Beginning single photo with audio pipeline: img=%s, audio=%s", job_id, source_path.name, audio_path.name)
+
+    try:
+        await _update_progress_message(
+            status_msg,
+            f"⚡ **Processing Video Reel...**\n\n"
+            f"🎬 **{clean_title}**\n\n"
+            f"🎵 Baking attached audio into Reel...",
+        )
+
+        processed_img_path = PROCESSED_DIR / f"{job_id}_frame.jpg"
+        from PIL import Image
+
+        with Image.open(source_path) as img:
+            rgb_img = img.convert("RGB")
+            # Instagram allows aspect ratio between 4:5 (0.80) and 1.91:1
+            curr_ratio = rgb_img.width / rgb_img.height
+            if curr_ratio < 0.8:
+                new_width = int(round(rgb_img.height * 0.8))
+                if new_width % 2 != 0:
+                    new_width += 1
+                canvas = Image.new("RGB", (new_width, rgb_img.height), (0, 0, 0))
+                canvas.paste(rgb_img, ((new_width - rgb_img.width) // 2, 0))
+                rgb_img = canvas
+            elif curr_ratio > 1.91:
+                new_height = int(round(rgb_img.width / 1.91))
+                if new_height % 2 != 0:
+                    new_height += 1
+                canvas = Image.new("RGB", (rgb_img.width, new_height), (0, 0, 0))
+                canvas.paste(rgb_img, (0, (new_height - rgb_img.height) // 2))
+                rgb_img = canvas
+
+            # Ensure even dimensions for video encoding
+            if rgb_img.width % 2 != 0 or rgb_img.height % 2 != 0:
+                even_w = rgb_img.width if rgb_img.width % 2 == 0 else rgb_img.width - 1
+                even_h = rgb_img.height if rgb_img.height % 2 == 0 else rgb_img.height - 1
+                rgb_img = rgb_img.crop((0, 0, even_w, even_h))
+
+            rgb_img.save(processed_img_path, format="JPEG", quality=95, optimize=True)
+
+        rendered_video_path = PROCESSED_DIR / f"{job_id}.mp4"
+
+        # Determine audio duration using ffprobe
+        audio_duration = 15.0
+        try:
+            from bot.processor import get_video_info
+            ainfo = get_video_info(audio_path)
+            if ainfo.get("duration"):
+                audio_duration = float(ainfo["duration"])
+        except Exception:
+            pass
+        audio_duration = min(60.0, max(5.0, audio_duration))
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1",
+            "-i", str(processed_img_path),
+            "-i", str(audio_path),
+            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "17",
+            "-tune", "stillimage",
+            "-c:a", "aac",
+            "-b:a", "320k",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-t", str(audio_duration),
+            "-shortest",
+            str(rendered_video_path),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+        # Upload rendered Reel to Azure Blob Storage
+        await _update_progress_message(
+            status_msg,
+            f"☁️ **Uploading Reel...**\n\n"
+            f"🎬 **{clean_title}**\n\n"
+            f"Uploading to cloud storage...",
+        )
+        upload_data = await azure_storage_manager.upload_video_blob(
+            job_id=job_id,
+            file_path=str(rendered_video_path),
+        )
+        job_store.complete_azure_upload(
+            job_id=job_id,
+            blob_name=upload_data["blob_name"],
+            sas_url=upload_data["sas_url"],
+            expires_at=upload_data["expires_at"],
+        )
+
+        job = job_store.get_job(job_id)
+        caption = (job.get("caption") if job else None) or resolve_job_caption(result, job_id)
+        job_store.set_job_caption(job_id, caption)
+
+        await _update_progress_message(
+            status_msg,
+            f"⚡ **Publishing Reel...**\n\n"
+            f"🎬 **{clean_title}**\n\n"
+            f"🚀 Publishing to Instagram...",
+        )
+        asyncio.create_task(
+            _run_instagram_publish_background(
+                job_id=job_id,
+                caption=caption,
+                status_msg=status_msg,
+            )
+        )
+
+    except Exception as exc:
+        err_msg = str(exc)
+        logger.error("[%s] Single image with audio pipeline failed: %s", job_id, err_msg, exc_info=True)
+        job_store.fail_processing(job_id, err_msg)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        await _update_progress_message(
+            status_msg,
+            f"❌ **Reel Processing Failed**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Reason**: {err_msg[:200]}\n\n"
+            f"Use `/retry {job_id}` to retry.",
+        )
 
 
 async def _handle_single_image_pipeline(
