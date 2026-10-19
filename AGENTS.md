@@ -224,6 +224,18 @@ sudo systemctl status unshockabl
 sudo systemctl status memoxz
 ```
 
+### 3. Fast 1-Click Update on Host
+Whenever new code is pushed to branch `uns`:
+```bash
+cd /home/azureuser/unshockabl
+chmod +x update.sh
+./update.sh
+# Or specify branch explicitly:
+./update.sh -b uns
+```
+This automatically pulls from the git branch, updates dependencies, and restarts `unshockabl.service`.
+
+
 ---
 
 ## 10. Important Operational Gotchas
