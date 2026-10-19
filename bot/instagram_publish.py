@@ -157,6 +157,42 @@ class InstagramPublisher:
         logger.info("Instagram Reels container created: container_id=%s", container_id)
         return container_id
 
+    async def create_photo_container(
+        self,
+        image_url: str,
+        caption: str,
+    ) -> str:
+        """
+        Creates a single photo media container on Instagram.
+        POST /{ig-user-id}/media with image_url and caption.
+        Returns the container ID.
+        """
+        endpoint = f"{self.base_url}/{self.business_account_id}/media"
+        payload = {
+            "image_url": image_url,
+            "caption": caption,
+            "access_token": self.access_token,
+        }
+
+        logger.info(
+            "Creating Instagram Photo container for account %s...",
+            self.business_account_id,
+        )
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(endpoint, data=payload)
+            data = resp.json()
+
+        if resp.status_code != 200 or "id" not in data:
+            err_dict = data.get("error", {})
+            exc = _classify_meta_error(err_dict, resp.status_code)
+            logger.error("Failed to create Photo container: %s", exc)
+            raise exc
+
+        container_id = data["id"]
+        logger.info("Instagram Photo container created: container_id=%s", container_id)
+        return container_id
+
     async def create_carousel_item_container(
         self,
         media_url: str,
@@ -443,6 +479,68 @@ class InstagramPublisher:
             logger.info("[%s] Successfully cleaned up temporary Azure video blob.", job_id)
         except Exception as cleanup_err:
             logger.warning("[%s] Non-fatal error cleaning up Azure video blob: %s", job_id, cleanup_err)
+
+        return {
+            "container_id": container_id,
+            "media_id": media_id,
+            "permalink": permalink,
+            "caption": final_caption,
+        }
+
+    async def publish_single_photo(
+        self,
+        job_id: str,
+        image_url: str,
+        caption: str,
+        progress_callback: Optional[Callable[[str, float], Awaitable[None]]] = None,
+    ) -> Dict[str, str]:
+        """
+        Full end-to-end single Photo publishing pipeline:
+        1. Rate limit safety check
+        2. Create photo container
+        3. Poll container status until FINISHED
+        4. Publish container
+        5. Fetch live permalink
+        6. Clean up Azure media blob
+        7. Update SQLite record
+        """
+        allowed, count = self.check_rate_limit()
+        if not allowed:
+            raise InstagramRateLimitError(
+                f"Instagram 24-hour publishing limit reached ({count} posts). "
+                "Please wait before posting more content."
+            )
+
+        final_caption = caption.strip()
+        if INSTAGRAM_CAPTION_SUFFIX and INSTAGRAM_CAPTION_SUFFIX not in final_caption:
+            final_caption = f"{final_caption}\n{INSTAGRAM_CAPTION_SUFFIX}".strip()
+
+        if progress_callback:
+            await progress_callback("Creating photo container...", 25.0)
+
+        container_id = await self.create_photo_container(
+            image_url=image_url,
+            caption=final_caption,
+        )
+        job_store.record_container_created(job_id, container_id)
+
+        if progress_callback:
+            await progress_callback("Processing image on Instagram...", 55.0)
+
+        await self.poll_container_status(container_id)
+
+        if progress_callback:
+            await progress_callback("Publishing photo...", 85.0)
+
+        media_id = await self.publish_container(container_id)
+        permalink = await self.get_media_permalink(media_id)
+        job_store.complete_publishing(job_id=job_id, media_id=media_id, permalink=permalink)
+
+        try:
+            azure_storage_manager.delete_job_video_blob(job_id)
+            logger.info("[%s] Successfully cleaned up temporary Azure image blob.", job_id)
+        except Exception as cleanup_err:
+            logger.warning("[%s] Non-fatal error cleaning up Azure image blob: %s", job_id, cleanup_err)
 
         return {
             "container_id": container_id,

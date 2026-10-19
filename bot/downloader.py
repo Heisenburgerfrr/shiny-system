@@ -21,6 +21,56 @@ logger = logging.getLogger("bot.downloader")
 BASE_DIR = Path(__file__).resolve().parent.parent
 DOWNLOADS_DIR = BASE_DIR / "storage" / "downloads"
 
+# Patch yt-dlp's Instagram extractor to support image posts and image carousels
+try:
+    from yt_dlp.extractor.instagram import InstagramBaseIE
+    _orig_extract_product_media = InstagramBaseIE._extract_product_media
+
+    def _patched_extract_product_media(self, product_media):
+        res = _orig_extract_product_media(self, product_media)
+        # If no video formats were found, populate formats with the highest-res image candidate
+        if not res.get("formats"):
+            img_url = None
+            w = None
+            h = None
+            if res.get("thumbnails"):
+                best_thumb = max(
+                    res["thumbnails"],
+                    key=lambda t: (t.get("width") or 0) * (t.get("height") or 0),
+                    default=res["thumbnails"][-1],
+                )
+                img_url = best_thumb.get("url")
+                w = best_thumb.get("width")
+                h = best_thumb.get("height")
+            elif product_media.get("display_resources"):
+                best_res = max(
+                    product_media["display_resources"],
+                    key=lambda r: (r.get("config_width") or 0) * (r.get("config_height") or 0),
+                    default=product_media["display_resources"][-1],
+                )
+                img_url = best_res.get("src")
+                w = best_res.get("config_width")
+                h = best_res.get("config_height")
+            elif product_media.get("display_url"):
+                img_url = product_media.get("display_url")
+
+            if img_url:
+                res["formats"].append({
+                    "url": img_url,
+                    "ext": "jpg",
+                    "format_id": "image",
+                    "width": w,
+                    "height": h,
+                    "vcodec": "mjpeg",
+                    "acodec": "none",
+                })
+        return res
+
+    InstagramBaseIE._extract_product_media = _patched_extract_product_media
+    logger.debug("Successfully applied image-support patch to InstagramBaseIE._extract_product_media")
+except Exception as patch_err:
+    logger.warning("Could not patch InstagramBaseIE._extract_product_media: %s", patch_err)
+
 
 @dataclass
 class DownloadResult:
@@ -31,7 +81,9 @@ class DownloadResult:
     file_path: str
     file_size: int
     is_carousel: bool = False
+    is_image: bool = False
     carousel_items: Optional[List[Dict[str, Any]]] = None
+    caption: Optional[str] = None
 
 
 class DownloadCategory:
@@ -71,7 +123,6 @@ def classify_error(exc: Exception) -> Tuple[str, str]:
         "captcha",
         "the page needs to be reloaded",
         "please sign in",
-        "no video formats found",
         "no longer supported in this application",
         "login required",
     ]):
@@ -223,7 +274,7 @@ class YouTubeDownloader:
         cookies_path = self._get_validated_cookies_path()
 
         if is_instagram:
-            format_str = "bestvideo*+bestaudio/best"
+            format_str = "best/bestvideo+bestaudio/bestvideo*+bestaudio/all"
             format_sort = ["res:1080", "quality", "size", "br", "fps"]
         else:
             # For YouTube: Strictly prioritize original audio and English audio tracks over foreign dubs
@@ -241,7 +292,6 @@ class YouTubeDownloader:
         ydl_opts: Dict[str, Any] = {
             "format": format_str,
             "format_sort": format_sort,
-            "merge_output_format": "mp4",
             "outtmpl": output_template,
             "socket_timeout": 20,
             "retries": 2,
@@ -251,7 +301,12 @@ class YouTubeDownloader:
             "nocheckcertificate": False,
         }
 
-        if not is_instagram:
+        if is_instagram:
+            ydl_opts["yes_playlist"] = True
+            ydl_opts["extract_flat"] = False
+        else:
+            ydl_opts["merge_output_format"] = "mp4"
+            ydl_opts["noplaylist"] = True
             ydl_opts["remote_components"] = ["ejs:github"]
 
             # Explicitly configure Deno runtime path for yt-dlp JS challenge solving
@@ -327,17 +382,20 @@ class YouTubeDownloader:
                 except Exception:
                     pass
 
-        # 1. Instagram Download Flow (Reels & Carousels)
-        if "instagram.com" in url.lower():
-            logger.info("[%s] Downloading Instagram media: %s", job_id, url)
+        # 1. Instagram Download Flow (Reels, Photos & Carousels)
+        if "instagram.com" in url.lower() or "instagr.am" in url.lower():
+            # Strip /share/ wrapping so yt-dlp recognizes the canonical post ID
+            clean_url = re.sub(r"/(?:share/)+(p|reel|reels|tv)/", r"/\1/", url)
+            logger.info("[%s] Downloading Instagram media: %s (canonical: %s)", job_id, url, clean_url)
             for attempt in range(1, max_network_retries + 1):
                 try:
                     opts = self._build_ydl_opts(job_id, "default", ytdlp_hook, is_instagram=True)
                     with yt_dlp.YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
+                        info = ydl.extract_info(clean_url, download=True)
                         if not info:
                             raise DownloadError("Failed to extract Instagram media.")
 
+                        raw_caption = (info.get("description") or info.get("title") or "Instagram Media").strip()
                         raw_title = info.get("title") or info.get("description") or "Instagram Media"
                         title = raw_title.replace("\n", " ").strip()
                         if len(title) > 60:
@@ -374,6 +432,7 @@ class YouTubeDownloader:
                                 dest_file = single_file
 
                             file_size = dest_file.stat().st_size
+                            is_img = dest_file.suffix.lower() in IMAGE_EXTS
                             return DownloadResult(
                                 job_id=job_id,
                                 title=title,
@@ -381,6 +440,8 @@ class YouTubeDownloader:
                                 file_path=str(dest_file.resolve()),
                                 file_size=file_size,
                                 is_carousel=False,
+                                is_image=is_img,
+                                caption=raw_caption,
                             )
 
                         # Case B: Multi-item Carousel post
@@ -412,6 +473,7 @@ class YouTubeDownloader:
                             file_size=total_size,
                             is_carousel=True,
                             carousel_items=items,
+                            caption=raw_caption,
                         )
                 except Exception as exc:
                     last_exception = exc
@@ -476,12 +538,14 @@ class YouTubeDownloader:
                             expected_file.name,
                             file_size,
                         )
+                        raw_yt_caption = (info.get("title") or info.get("description") or "YouTube Video").strip()
                         return DownloadResult(
                             job_id=job_id,
                             title=title,
                             duration=duration,
                             file_path=str(expected_file.resolve()),
                             file_size=file_size,
+                            caption=raw_yt_caption,
                         )
 
                 except Exception as exc:

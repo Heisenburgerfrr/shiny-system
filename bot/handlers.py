@@ -44,15 +44,15 @@ YOUTUBE_URL_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Regex to detect Instagram URLs (reels, p/posts, share links)
+# Regex to detect Instagram URLs (reels, p/posts, tv, share links, with optional username segment)
 INSTAGRAM_URL_REGEX = re.compile(
-    r"(https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:reel|reels|p|share)/[a-zA-Z0-9_\-]+[^\s]*)",
+    r"(https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:(?:share/)?(?:p|reel|reels|tv)/|(?:(?!direct/|stories/|explore/)[^/?#\s]+/)?(?:p|reel|reels|tv)/)[a-zA-Z0-9_\-]+[^\s]*)",
     re.IGNORECASE,
 )
 
 # Unified Media URL Regex matching either YouTube or Instagram
 MEDIA_URL_REGEX = re.compile(
-    r"(https?://(?:www\.)?(?:youtube\.com/(?:watch\?[^\s]*v=|shorts/|live/|embed/)|youtu\.be/|(?:instagram\.com|instagr\.am)/(?:reel|reels|p|share)/)[a-zA-Z0-9_\-]+[^\s]*)",
+    r"(https?://(?:www\.)?(?:youtube\.com/(?:watch\?[^\s]*v=|shorts/|live/|embed/)|youtu\.be/|(?:instagram\.com|instagr\.am)/(?:(?:share/)?(?:p|reel|reels|tv)/|(?:(?!direct/|stories/|explore/)[^/?#\s]+/)?(?:p|reel|reels|tv)/))[a-zA-Z0-9_\-]+[^\s]*)",
     re.IGNORECASE,
 )
 
@@ -176,11 +176,43 @@ DEFAULT_MEME_CAPTION = (
 )
 
 
+def is_caption_enabled() -> bool:
+    """Returns True if custom default caption template feature is enabled, False otherwise (default: False/off)."""
+    return job_store.get_setting("caption_enabled", "false").lower() in ("true", "1", "yes", "on")
+
+
+def _build_caption_components() -> Tuple[str, InlineKeyboardMarkup]:
+    """Builds message text and inline keyboard for the /caption dashboard."""
+    enabled = is_caption_enabled()
+    current = job_store.get_setting("default_caption") or DEFAULT_MEME_CAPTION
+
+    if enabled:
+        status_line = "🟢 **Feature Status**: **TURNED ON**\n*(Custom template will be applied to every Reel sent without an inline caption)*"
+        toggle_button = InlineKeyboardButton("🔴 Turn off this feature", callback_data="toggle_caption_off")
+    else:
+        status_line = "⚪ **Feature Status**: **TURNED OFF** (Default)\n*(Reels will automatically use the original video title from YouTube/Instagram)*"
+        toggle_button = InlineKeyboardButton("🟢 Turn on this feature", callback_data="toggle_caption_on")
+
+    keyboard = InlineKeyboardMarkup([
+        [toggle_button],
+        [InlineKeyboardButton("✏️ Change Default Caption", callback_data="change_caption")],
+    ])
+
+    text = (
+        f"📝 **Default Caption / Title Settings**\n\n"
+        f"{status_line}\n\n"
+        f"📋 **Current Template:**\n"
+        f"{current}\n\n"
+        f"💡 *Toggle above to enable/disable. When turned off, Reels automatically use the video's original title.*"
+    )
+    return text, keyboard
+
+
 @restricted
 async def caption_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handles /caption: displays the current default caption template,
-    or immediately updates it if arguments were provided (/caption <new text>).
+    with an interactive toggle button to turn the feature on or off.
     """
     message = update.effective_message
     if not message:
@@ -193,66 +225,91 @@ async def caption_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if new_caption:
             job_store.set_setting("default_caption", new_caption)
             context.user_data["awaiting"] = None
+            text, keyboard = _build_caption_components()
             await message.reply_text(
-                f"✅ **Default caption updated!**\n\n"
-                f"📝 **New Template:**\n{new_caption}\n\n"
-                f"💡 All YouTube links sent without a custom caption will use this automatically.",
+                f"✅ **Default caption updated!**\n\n{text}",
+                reply_markup=keyboard,
                 parse_mode="Markdown",
             )
             return
 
-    current = job_store.get_setting("default_caption") or DEFAULT_MEME_CAPTION
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Change Default Caption", callback_data="change_caption")]
-    ])
-
+    text, keyboard = _build_caption_components()
     await message.reply_text(
-        f"📝 **Current Default Caption Template:**\n\n"
-        f"{current}\n\n"
-        f"💡 *YouTube links sent without a caption will automatically use this template.*",
+        text,
         reply_markup=keyboard,
         parse_mode="Markdown",
     )
 
 
+def is_cover_enabled() -> bool:
+    """Returns True if custom Reels cover image feature is enabled, False otherwise (default: False/off)."""
+    return job_store.get_setting("cover_enabled", "false").lower() in ("true", "1", "yes", "on")
+
+
+def _build_cover_components() -> Tuple[str, InlineKeyboardMarkup, bool]:
+    """Builds caption text, inline keyboard, and photo validity flag for /cover dashboard."""
+    enabled = is_cover_enabled()
+    cover_path = config.default_cover_path
+    cover_info = inspect_cover_image(cover_path)
+
+    if enabled:
+        status_line = "🟢 **Feature Status**: **TURNED ON**\n*(Custom cover will be applied to every Reel)*"
+        toggle_button = InlineKeyboardButton("🔴 Turn off this feature", callback_data="toggle_cover_off")
+    else:
+        status_line = "⚪ **Feature Status**: **TURNED OFF** (Default)\n*(Instagram will use the video's native thumbnail)*"
+        toggle_button = InlineKeyboardButton("🟢 Turn on this feature", callback_data="toggle_cover_on")
+
+    keyboard = InlineKeyboardMarkup([
+        [toggle_button],
+        [InlineKeyboardButton("🖼️ Change Cover Image", callback_data="change_cover")],
+    ])
+
+    if cover_path.exists() and cover_info.is_valid:
+        text = (
+            f"🖼️ **Reels Cover Settings**\n\n"
+            f"{status_line}\n\n"
+            f"• **Dimensions**: `{cover_info.width}x{cover_info.height}` ({cover_info.format})\n"
+            f"• **Aspect Ratio**: 9:16 (Instagram Reels compliant)\n"
+            f"• **File Size**: `{cover_info.file_size / 1024:.1f} KB`\n\n"
+            f"💡 *Toggle above to enable/disable. When turned off, Reels automatically use the video's own thumbnail.*"
+        )
+        has_valid_photo = True
+    else:
+        text = (
+            f"🖼️ **Reels Cover Settings**\n\n"
+            f"{status_line}\n\n"
+            f"• **Status**: `{cover_info.status_summary}` ({cover_info.details})\n\n"
+            f"💡 *Toggle above to enable/disable. When turned off, Reels automatically use the video's own thumbnail.*"
+        )
+        has_valid_photo = False
+
+    return text, keyboard, has_valid_photo
+
+
 @restricted
 async def cover_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handles /cover: displays the current Reels cover image with resolution and specs,
-    and provides an inline button to change it.
+    Handles /cover: displays the current Reels cover image with resolution, specs,
+    and interactive toggle button to turn the feature on or off.
     """
     message = update.effective_message
     if not message:
         return
 
+    text, keyboard, has_valid_photo = _build_cover_components()
     cover_path = config.default_cover_path
-    cover_info = inspect_cover_image(cover_path)
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🖼️ Change Cover Image", callback_data="change_cover")]
-    ])
-
-    if cover_path.exists() and cover_info.is_valid:
-        caption_text = (
-            f"🖼️ **Current Reels Cover Image**\n\n"
-            f"• **Dimensions**: `{cover_info.width}x{cover_info.height}` ({cover_info.format})\n"
-            f"• **Aspect Ratio**: 9:16 (Instagram Reels compliant)\n"
-            f"• **File Size**: `{cover_info.file_size / 1024:.1f} KB`\n\n"
-            f"💡 *Click below to upload a new cover image. It will be automatically cropped to 9:16.*"
-        )
+    if has_valid_photo:
         with open(cover_path, "rb") as photo_f:
             await message.reply_photo(
                 photo=photo_f,
-                caption=caption_text,
+                caption=text,
                 reply_markup=keyboard,
                 parse_mode="Markdown",
             )
     else:
         await message.reply_text(
-            f"🖼️ **Reels Cover Image**\n\n"
-            f"Status: `{cover_info.status_summary}` ({cover_info.details})\n\n"
-            f"Click below to upload a new cover image.",
+            text,
             reply_markup=keyboard,
             parse_mode="Markdown",
         )
@@ -396,13 +453,51 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
     await query.answer()
 
-    if query.data == "change_caption":
+    if query.data == "toggle_caption_on":
+        job_store.set_setting("caption_enabled", "true")
+        await query.answer("🟢 Custom caption template turned ON!", show_alert=False)
+        text, keyboard = _build_caption_components()
+        try:
+            await query.message.edit_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+        except Exception as edit_err:
+            logger.debug("Failed to edit caption message inline: %s", edit_err)
+    elif query.data == "toggle_caption_off":
+        job_store.set_setting("caption_enabled", "false")
+        await query.answer("⚪ Custom caption template turned OFF! (Reels will use video title)", show_alert=False)
+        text, keyboard = _build_caption_components()
+        try:
+            await query.message.edit_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+        except Exception as edit_err:
+            logger.debug("Failed to edit caption message inline: %s", edit_err)
+    elif query.data == "change_caption":
         context.user_data["awaiting"] = "caption"
         await query.message.reply_text(
             "✍️ **Send your new default caption now.**\n\n"
             "Simply send your desired caption as a text message, and it will be saved as the default template for all future Reels.",
             parse_mode="Markdown",
         )
+    elif query.data == "toggle_cover_on":
+        job_store.set_setting("cover_enabled", "true")
+        await query.answer("🟢 Custom cover feature turned ON!", show_alert=False)
+        text, keyboard, _ = _build_cover_components()
+        try:
+            if query.message.photo:
+                await query.message.edit_caption(caption=text, reply_markup=keyboard, parse_mode="Markdown")
+            else:
+                await query.message.edit_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+        except Exception as edit_err:
+            logger.debug("Failed to edit cover message inline: %s", edit_err)
+    elif query.data == "toggle_cover_off":
+        job_store.set_setting("cover_enabled", "false")
+        await query.answer("⚪ Custom cover feature turned OFF! (Reels will use video thumbnail)", show_alert=False)
+        text, keyboard, _ = _build_cover_components()
+        try:
+            if query.message.photo:
+                await query.message.edit_caption(caption=text, reply_markup=keyboard, parse_mode="Markdown")
+            else:
+                await query.message.edit_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+        except Exception as edit_err:
+            logger.debug("Failed to edit cover message inline: %s", edit_err)
     elif query.data == "change_cover":
         context.user_data["awaiting"] = "cover"
         await query.message.reply_text(
@@ -520,18 +615,27 @@ async def photo_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         azure_storage_manager._cover_cache.clear()
         context.user_data["awaiting"] = None
 
+        _, keyboard, _ = _build_cover_components()
+        enabled = is_cover_enabled()
+        feature_note = (
+            "✨ Feature is **ON**: This cover will be attached to all future Reels."
+            if enabled else
+            "💡 Feature is currently **OFF**: Reels will use video's native thumbnail unless you turn it on."
+        )
+
         success_text = (
             f"✅ **New Reels Cover Applied!**\n\n"
             f"• **Resolution**: `{res.width}x{res.height}` (9:16)\n"
             f"• **Format**: `{res.format}` ({res.file_size / 1024:.1f} KB)\n"
             f"• **Optimization**: Center-cropped to 9:16 aspect ratio\n\n"
-            f"✨ All future Instagram Reels will automatically use this cover!"
+            f"{feature_note}"
         )
 
         with open(target_path, "rb") as photo_f:
             await message.reply_photo(
                 photo=photo_f,
                 caption=success_text,
+                reply_markup=keyboard,
                 parse_mode="Markdown",
             )
         await status_msg.delete()
@@ -656,7 +760,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # 4. Default Cover Image check (Stage 4)
     cover_res = inspect_cover_image(config.default_cover_path)
-    cover_status = "Ready" if cover_res.is_valid else f"Warning: {cover_res.details}"
+    cov_mode = "ON (Custom Image)" if is_cover_enabled() else "OFF (Video Thumbnail)"
+    cover_status = f"Ready [{cov_mode}]" if cover_res.is_valid else f"Warning: {cover_res.details} [{cov_mode}]"
+
+    # 5. Default Caption Template check
+    cap_mode = "ON (Custom Template)" if is_caption_enabled() else "OFF (Video Title)"
+    caption_status = f"Ready [{cap_mode}]"
 
     overall_ok = ig_ok and azure_ok and cover_res.is_valid
     summary = "✅ All systems operational." if overall_ok else "⚠️ One or more checks failed. Review logs."
@@ -666,7 +775,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"• **Telegram Bot**: `{tg_status}`\n"
         f"• **Instagram API**: `{ig_status}`\n"
         f"• **Azure Storage**: `{azure_status}`\n"
-        f"• **Cover Image**: `{cover_status}`\n\n"
+        f"• **Cover Image**: `{cover_status}`\n"
+        f"• **Default Caption**: `{caption_status}`\n\n"
         f"{summary}"
     )
 
@@ -766,9 +876,31 @@ async def _run_download_background(
         clean_title = _clean_title(result.title)
         logger.info("[%s] Download succeeded: '%s' (%s). Starting processing...", job_id, result.title, size_str)
 
-        # Branch for multi-slide carousel posts
+        # Set job caption from downloaded post if no inline caption was provided
+        job = job_store.get_job(job_id)
+        if not (job and job.get("caption")):
+            if is_caption_enabled():
+                caption_text = job_store.get_setting("default_caption") or DEFAULT_MEME_CAPTION
+                job_store.set_job_caption(job_id, caption_text)
+                logger.info("[%s] Custom caption is ON. Assigned custom template (%d chars).", job_id, len(caption_text))
+            else:
+                post_caption = (result.caption or clean_title).strip()
+                job_store.set_job_caption(job_id, post_caption)
+                logger.info("[%s] Custom caption is OFF. Assigned original post caption (%d chars): %s", job_id, len(post_caption), post_caption[:60])
+
+        # Branch for multi-slide carousel posts (2 or more slides)
         if result.is_carousel and result.carousel_items and len(result.carousel_items) > 1:
             await _handle_carousel_pipeline(
+                job_id=job_id,
+                result=result,
+                status_msg=status_msg,
+                loop=loop,
+            )
+            return
+
+        # Branch for single photo / image post
+        if getattr(result, "is_image", False) or Path(result.file_path).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+            await _handle_single_image_pipeline(
                 job_id=job_id,
                 result=result,
                 status_msg=status_msg,
@@ -837,8 +969,9 @@ async def _run_download_background(
         await _update_progress_message(status_msg, upload_msg)
 
         try:
-            # 1. Ensure cover image is hosted
-            cover_data = await azure_storage_manager.ensure_cover_uploaded(config.default_cover_path)
+            # 1. Ensure cover image is hosted if custom cover feature is on
+            if is_cover_enabled():
+                await azure_storage_manager.ensure_cover_uploaded(config.default_cover_path)
 
             # 2. Upload video blob with retries and verify reachability
             video_data = await azure_storage_manager.upload_video_blob(
@@ -965,8 +1098,13 @@ async def _run_instagram_publish_background(
         )
         return
 
-    cover_data = await azure_storage_manager.ensure_cover_uploaded(config.default_cover_path)
-    cover_sas_url = cover_data.get("sas_url")
+    cover_sas_url = None
+    if is_cover_enabled():
+        cover_data = await azure_storage_manager.ensure_cover_uploaded(config.default_cover_path)
+        cover_sas_url = cover_data.get("sas_url")
+        logger.info("[%s] Custom cover feature is ON. Using custom cover: %s", job_id, cover_sas_url)
+    else:
+        logger.info("[%s] Custom cover feature is OFF. Publishing Reel using video native thumbnail.", job_id)
 
     last_update_time = 0.0
 
@@ -1080,6 +1218,7 @@ async def _handle_carousel_pipeline(
         )
 
         uploaded_items: List[Dict[str, str]] = []
+        target_aspect_ratio: Optional[float] = None
 
         for idx, item in enumerate(items, start=1):
             item_type = item.get("type", "video")
@@ -1111,6 +1250,15 @@ async def _handle_carousel_pipeline(
                         update_job_store=False,
                     )
 
+                if target_aspect_ratio is None:
+                    try:
+                        vinfo = get_video_info(processed_slide_path)
+                        vw = vinfo.get("width") or 1080
+                        vh = vinfo.get("height") or 1080
+                        target_aspect_ratio = max(0.8, min(1.91, vw / vh))
+                    except Exception:
+                        target_aspect_ratio = 1.0
+
                 # Upload video slide to Azure Blob Storage
                 await _update_progress_message(
                     status_msg,
@@ -1140,6 +1288,27 @@ async def _handle_carousel_pipeline(
                     from PIL import Image
                     with Image.open(source_path) as img:
                         rgb_img = img.convert("RGB")
+                        if target_aspect_ratio is None:
+                            # Slide 1 sets the target aspect ratio for all slides (Instagram allows 4:5 to 1.91:1)
+                            raw_ratio = rgb_img.width / rgb_img.height
+                            target_aspect_ratio = max(0.8, min(1.91, raw_ratio))
+
+                        # Normalize slide aspect ratio to match target_aspect_ratio to prevent Meta error 2207050
+                        curr_ratio = rgb_img.width / rgb_img.height
+                        if abs(curr_ratio - target_aspect_ratio) > 0.02:
+                            if curr_ratio > target_aspect_ratio:
+                                # Wider than target: pad height (top & bottom)
+                                new_height = int(round(rgb_img.width / target_aspect_ratio))
+                                canvas = Image.new("RGB", (rgb_img.width, new_height), (0, 0, 0))
+                                canvas.paste(rgb_img, (0, (new_height - rgb_img.height) // 2))
+                                rgb_img = canvas
+                            else:
+                                # Taller than target: pad width (left & right)
+                                new_width = int(round(rgb_img.height * target_aspect_ratio))
+                                canvas = Image.new("RGB", (new_width, rgb_img.height), (0, 0, 0))
+                                canvas.paste(rgb_img, ((new_width - rgb_img.width) // 2, 0))
+                                rgb_img = canvas
+
                         rgb_img.save(processed_img_path, format="JPEG", quality=95, optimize=True)
                 except Exception as img_err:
                     logger.warning("[%s] Pillow processing failed for slide %d: %s. Copying original...", job_id, idx, img_err)
@@ -1163,7 +1332,13 @@ async def _handle_carousel_pipeline(
 
         # All slides processed and uploaded to Azure!
         job = job_store.get_job(job_id)
-        caption = (job.get("caption") if job else None) or job_store.get_setting("default_caption") or DEFAULT_MEME_CAPTION
+        caption = (job.get("caption") if job else None)
+        if not caption:
+            if is_caption_enabled():
+                caption = job_store.get_setting("default_caption") or DEFAULT_MEME_CAPTION
+            else:
+                caption = (result.caption or clean_title).strip()
+            job_store.set_job_caption(job_id, caption)
 
         await _update_progress_message(
             status_msg,
@@ -1299,6 +1474,203 @@ async def _run_instagram_carousel_publish_background(
         task_registry.unregister_task(job_id)
 
 
+async def _handle_single_image_pipeline(
+    job_id: str,
+    result: DownloadResult,
+    status_msg: Message,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Handles single Instagram photo/image posts (e.g. meme, single slide)."""
+    clean_title = _clean_title(result.title)
+    source_path = Path(result.file_path)
+    logger.info("[%s] Beginning single photo pipeline: %s", job_id, source_path.name)
+
+    try:
+        await _update_progress_message(
+            status_msg,
+            f"⚡ **Processing Photo Post...**\n\n"
+            f"🖼️ **{clean_title}**\n\n"
+            f"Optimizing image for Instagram specifications...",
+        )
+
+        processed_img_path = PROCESSED_DIR / f"{job_id}.jpg"
+        from PIL import Image
+
+        with Image.open(source_path) as img:
+            rgb_img = img.convert("RGB")
+            # Instagram requires aspect ratio between 4:5 (0.80) and 1.91:1
+            ratio = rgb_img.width / rgb_img.height
+            if ratio < 0.8:
+                new_width = int(round(rgb_img.height * 0.8))
+                canvas = Image.new("RGB", (new_width, rgb_img.height), (0, 0, 0))
+                canvas.paste(rgb_img, ((new_width - rgb_img.width) // 2, 0))
+                canvas.save(processed_img_path, format="JPEG", quality=95, optimize=True)
+            elif ratio > 1.91:
+                new_height = int(round(rgb_img.width / 1.91))
+                canvas = Image.new("RGB", (rgb_img.width, new_height), (0, 0, 0))
+                canvas.paste(rgb_img, (0, (new_height - rgb_img.height) // 2))
+                canvas.save(processed_img_path, format="JPEG", quality=95, optimize=True)
+            else:
+                rgb_img.save(processed_img_path, format="JPEG", quality=95, optimize=True)
+
+        # Upload image to Azure Blob Storage
+        await _update_progress_message(
+            status_msg,
+            f"☁️ **Uploading Photo...**\n\n"
+            f"🖼️ **{clean_title}**\n\n"
+            f"Uploading to cloud storage...",
+        )
+        upload_data = await azure_storage_manager.upload_media_blob(
+            job_id=job_id,
+            file_path=str(processed_img_path),
+            blob_name=f"{job_id}.jpg",
+            content_type="image/jpeg",
+        )
+        image_url = upload_data["sas_url"]
+
+        job = job_store.get_job(job_id)
+        caption = (job.get("caption") if job else None)
+        if not caption:
+            if is_caption_enabled():
+                caption = job_store.get_setting("default_caption") or DEFAULT_MEME_CAPTION
+            else:
+                caption = (result.caption or clean_title).strip()
+            job_store.set_job_caption(job_id, caption)
+
+        await _update_progress_message(
+            status_msg,
+            f"⚡ **Publishing Photo...**\n\n"
+            f"🖼️ **{clean_title}**\n\n"
+            f"🚀 Publishing to Instagram...",
+        )
+        asyncio.create_task(
+            _run_instagram_photo_publish_background(
+                job_id=job_id,
+                image_url=image_url,
+                caption=caption,
+                status_msg=status_msg,
+                title=clean_title,
+            )
+        )
+
+    except asyncio.CancelledError:
+        logger.info("[%s] Photo pipeline was cancelled.", job_id)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        raise
+    except Exception as exc:
+        err_msg = str(exc)
+        job_store.fail_processing(job_id, err_msg)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        logger.error("[%s] Photo processing pipeline failed: %s", job_id, err_msg, exc_info=True)
+        await _update_progress_message(
+            status_msg,
+            f"❌ **Photo Processing Failed**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Reason**: {err_msg[:200]}\n\n"
+            f"Review logs or use `/retry {job_id}`.",
+        )
+
+
+async def _run_instagram_photo_publish_background(
+    job_id: str,
+    image_url: str,
+    caption: str,
+    status_msg: Message,
+    title: str = "Instagram Photo",
+) -> None:
+    """Executes the single photo Instagram publishing pipeline."""
+    current_task = asyncio.current_task()
+    if current_task:
+        task_registry.register_task(job_id, current_task)
+
+    job_store.start_publishing(job_id, caption=caption)
+    clean_photo_title = _clean_title(title)
+    last_update_time = 0.0
+
+    async def publish_progress(status_code: str, elapsed: float) -> None:
+        nonlocal last_update_time
+        now = time.monotonic()
+        if now - last_update_time >= 3.0:
+            last_update_time = now
+            msg_text = (
+                f"⚡ **Publishing Photo...**\n\n"
+                f"🖼️ **{clean_photo_title}**\n\n"
+                f"🚀 Rendering on Instagram ({int(elapsed)}s)..."
+            )
+            await _update_progress_message(status_msg, msg_text)
+
+    try:
+        publish_res = await instagram_publisher.publish_single_photo(
+            job_id=job_id,
+            image_url=image_url,
+            caption=caption,
+            progress_callback=publish_progress,
+        )
+
+        storage_cleaner.cleanup_job_local_files(job_id)
+        failure_tracker.record_success("instagram_publish")
+
+        permalink = publish_res.get("permalink", "https://instagram.com")
+        success_msg = (
+            f"🎉 **Photo Published!**\n\n"
+            f"🖼️ **{clean_photo_title}**\n\n"
+            f"👉 [Watch on Instagram]({permalink})"
+        )
+        await _update_progress_message(status_msg, success_msg)
+        logger.info("[%s] Instagram Photo successfully published: %s", job_id, permalink)
+
+    except asyncio.CancelledError:
+        logger.info("[%s] Instagram photo publish task was cancelled.", job_id)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        raise
+
+    except InstagramTokenExpiredError as token_err:
+        job_store.fail_publishing(job_id, str(token_err))
+        storage_cleaner.cleanup_job_local_files(job_id)
+        sys_alert = failure_tracker.record_failure("token", job_id, str(token_err))
+        alert_msg = (
+            f"🚨 **CRITICAL: Instagram Access Token Expired!**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Error**: Meta rejected the access token as expired or invalid.\n\n"
+            f"⚠️ **Action Required**: Please update your permanent access token."
+        )
+        if sys_alert:
+            alert_msg += f"\n\n{sys_alert}"
+        await _update_progress_message(status_msg, alert_msg)
+
+    except InstagramRateLimitError as rate_err:
+        job_store.fail_publishing(job_id, str(rate_err))
+        storage_cleaner.cleanup_job_local_files(job_id)
+        sys_alert = failure_tracker.record_failure("instagram_publish", job_id, str(rate_err))
+        rate_msg = (
+            f"⏳ **Instagram Rate Limit Reached**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Reason**: {rate_err}\n\n"
+            f"Please wait before publishing more posts."
+        )
+        if sys_alert:
+            rate_msg += f"\n\n{sys_alert}"
+        await _update_progress_message(status_msg, rate_msg)
+
+    except Exception as exc:
+        err_msg = str(exc)
+        job_store.fail_publishing(job_id, err_msg)
+        storage_cleaner.cleanup_job_local_files(job_id)
+        sys_alert = failure_tracker.record_failure("instagram_publish", job_id, err_msg)
+        logger.error("[%s] Instagram photo publishing failed: %s", job_id, err_msg, exc_info=True)
+        fail_msg = (
+            f"❌ **Instagram Photo Publish Failed**\n\n"
+            f"• **Job ID**: `{job_id}`\n"
+            f"• **Reason**: {err_msg}\n\n"
+            f"Review logs or use `/retry {job_id}`."
+        )
+        if sys_alert:
+            fail_msg += f"\n\n{sys_alert}"
+        await _update_progress_message(status_msg, fail_msg)
+    finally:
+        task_registry.unregister_task(job_id)
+
+
 @restricted
 async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -1319,10 +1691,10 @@ async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         new_caption = message.text.strip()
         job_store.set_setting("default_caption", new_caption)
         user_data["awaiting"] = None
+        text, keyboard = _build_caption_components()
         await message.reply_text(
-            f"✅ **Default caption updated successfully!**\n\n"
-            f"📝 **New Default Template:**\n{new_caption}\n\n"
-            f"💡 Future Reels sent without a caption will automatically use this template.",
+            f"✅ **Default caption updated successfully!**\n\n{text}",
+            reply_markup=keyboard,
             parse_mode="Markdown",
         )
         return
@@ -1412,27 +1784,35 @@ async def youtube_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     caption_part = raw_text.replace(match.group(0), "").strip()
     inline_caption = caption_part if caption_part else None
 
-    # If no inline caption provided, use the configured default caption template!
-    final_caption = inline_caption
-    if not final_caption:
+    # Determine caption:
+    # 1. Inline caption typed directly in the Telegram message -> Always use it.
+    # 2. Custom caption template is turned ON -> Use default template from /caption.
+    # 3. Custom caption template is turned OFF (Default) -> Leave None for now;
+    #    the original post caption/title will be assigned automatically after download!
+    if inline_caption:
+        final_caption = inline_caption
+    elif is_caption_enabled():
         final_caption = job_store.get_setting("default_caption") or DEFAULT_MEME_CAPTION
+    else:
+        final_caption = None
 
     # 1. Generate unique Job ID (UUID4)
     job_id = str(uuid.uuid4())
     logger.info(
-        "New download job registered: job_id=%s, user_id=%s, url=%s, platform=%s, has_inline_caption=%s",
+        "New download job registered: job_id=%s, user_id=%s, url=%s, platform=%s, has_inline_caption=%s, caption_template_on=%s",
         job_id,
         user_id,
         url,
         platform_name,
         bool(inline_caption),
+        is_caption_enabled(),
     )
 
-    # 2. Persist in SQLite Job Store (with final caption stored so it auto-publishes)
+    # 2. Persist in SQLite Job Store (with final caption stored if pre-determined)
     job_store.create_job(job_id=job_id, user_id=user_id, source_url=url, caption=final_caption)
 
     # 3. Send immediate acknowledgment message
-    caption_note = " (with custom caption)" if inline_caption else ""
+    caption_note = " (with custom caption)" if inline_caption else " (with template)" if is_caption_enabled() else ""
     ack_text = (
         f"⚡ **Processing {platform_name} {post_type_label}{caption_note}...**\n\n"
         f"📥 Connecting to {platform_name}..."
@@ -1468,7 +1848,8 @@ async def _resume_azure_upload(
         )
 
     try:
-        await azure_storage_manager.ensure_cover_uploaded(config.default_cover_path)
+        if is_cover_enabled():
+            await azure_storage_manager.ensure_cover_uploaded(config.default_cover_path)
         video_data = await azure_storage_manager.upload_video_blob(
             job_id=job_id,
             file_path=processed_path,
@@ -1881,11 +2262,14 @@ async def publish_to_instagram(video_url: str, caption: str, job_id: str) -> Dic
     Public entry point for publishing hosted video to Instagram Reels.
     Uses InstagramPublisher implemented in Stage 6.
     """
-    cover_data = await azure_storage_manager.ensure_cover_uploaded(config.default_cover_path)
+    cover_sas_url = None
+    if is_cover_enabled():
+        cover_data = await azure_storage_manager.ensure_cover_uploaded(config.default_cover_path)
+        cover_sas_url = cover_data.get("sas_url")
     return await instagram_publisher.publish_reel(
         job_id=job_id,
         video_url=video_url,
         caption=caption,
-        cover_url=cover_data.get("sas_url"),
+        cover_url=cover_sas_url,
     )
 
