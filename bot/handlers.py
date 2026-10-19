@@ -9,7 +9,7 @@ import re
 import shutil
 import time
 import uuid
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 from azure.storage.blob import BlobServiceClient
@@ -800,6 +800,60 @@ def _clean_title(title: Optional[str]) -> str:
     return clean[:80] or "Instagram Reel"
 
 
+def resolve_job_caption(result: Any, job_id: str) -> str:
+    """
+    Determines the final caption for a post:
+    1. If an explicit caption was assigned to this job, use it.
+    2. If custom caption feature is ON (/caption or /title), use default template.
+    3. If custom caption is OFF:
+       - Check if original post has a valid caption/title (not empty, and not generic).
+       - If valid, use original post caption/title.
+       - If NO caption/title exists (or is generic/empty), fallback to default template from /caption or /title!
+    """
+    job = job_store.get_job(job_id)
+    if job and job.get("caption"):
+        return job["caption"].strip()
+
+    default_template = (job_store.get_setting("default_caption") or DEFAULT_MEME_CAPTION).strip()
+
+    if is_caption_enabled():
+        logger.info("[%s] Custom caption is ON. Using custom template.", job_id)
+        return default_template
+
+    # Custom caption is OFF: inspect original post caption / title
+    clean_title = _clean_title(result.title) if hasattr(result, "title") else ""
+    raw_caption = getattr(result, "caption", None)
+    original_caption = (raw_caption or clean_title or "").strip()
+
+    GENERIC_NAMES = {
+        "instagram media",
+        "instagram video",
+        "instagram photo",
+        "instagram reel",
+        "instagram post",
+        "video by",
+        "post by",
+        "untitled",
+        "none",
+        "",
+    }
+    is_generic = (
+        not original_caption
+        or original_caption.lower() in GENERIC_NAMES
+        or original_caption.lower().startswith("video by ")
+        or original_caption.lower().startswith("post by ")
+    )
+
+    if not is_generic:
+        logger.info("[%s] Custom caption is OFF. Using original post caption (%d chars): %s", job_id, len(original_caption), original_caption[:60])
+        return original_caption
+
+    # No caption or title was provided in the Instagram post -> fallback to default template from /caption or /title
+    logger.info("[%s] Original post has no caption/title. Falling back to default template from /caption.", job_id)
+    return default_template
+
+
+
 async def _update_progress_message(
     status_msg: Message,
     text: str,
@@ -876,17 +930,9 @@ async def _run_download_background(
         clean_title = _clean_title(result.title)
         logger.info("[%s] Download succeeded: '%s' (%s). Starting processing...", job_id, result.title, size_str)
 
-        # Set job caption from downloaded post if no inline caption was provided
-        job = job_store.get_job(job_id)
-        if not (job and job.get("caption")):
-            if is_caption_enabled():
-                caption_text = job_store.get_setting("default_caption") or DEFAULT_MEME_CAPTION
-                job_store.set_job_caption(job_id, caption_text)
-                logger.info("[%s] Custom caption is ON. Assigned custom template (%d chars).", job_id, len(caption_text))
-            else:
-                post_caption = (result.caption or clean_title).strip()
-                job_store.set_job_caption(job_id, post_caption)
-                logger.info("[%s] Custom caption is OFF. Assigned original post caption (%d chars): %s", job_id, len(post_caption), post_caption[:60])
+        # Set job caption (uses original post caption/title, or falls back to /caption default if none exists)
+        final_caption = resolve_job_caption(result, job_id)
+        job_store.set_job_caption(job_id, final_caption)
 
         # Branch for multi-slide carousel posts (2 or more slides)
         if result.is_carousel and result.carousel_items and len(result.carousel_items) > 1:
@@ -1332,13 +1378,8 @@ async def _handle_carousel_pipeline(
 
         # All slides processed and uploaded to Azure!
         job = job_store.get_job(job_id)
-        caption = (job.get("caption") if job else None)
-        if not caption:
-            if is_caption_enabled():
-                caption = job_store.get_setting("default_caption") or DEFAULT_MEME_CAPTION
-            else:
-                caption = (result.caption or clean_title).strip()
-            job_store.set_job_caption(job_id, caption)
+        caption = (job.get("caption") if job else None) or resolve_job_caption(result, job_id)
+        job_store.set_job_caption(job_id, caption)
 
         await _update_progress_message(
             status_msg,
@@ -1529,13 +1570,8 @@ async def _handle_single_image_pipeline(
         image_url = upload_data["sas_url"]
 
         job = job_store.get_job(job_id)
-        caption = (job.get("caption") if job else None)
-        if not caption:
-            if is_caption_enabled():
-                caption = job_store.get_setting("default_caption") or DEFAULT_MEME_CAPTION
-            else:
-                caption = (result.caption or clean_title).strip()
-            job_store.set_job_caption(job_id, caption)
+        caption = (job.get("caption") if job else None) or resolve_job_caption(result, job_id)
+        job_store.set_job_caption(job_id, caption)
 
         await _update_progress_message(
             status_msg,
